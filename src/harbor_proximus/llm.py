@@ -112,6 +112,8 @@ def resolve_credentials(
 
 # Provider error strings that indicate context-window overflow when a backend
 # surfaces it as a generic bad-request error instead of a typed exception.
+# Adapted from Harbor's LiteLLM context-length check (harbor.llms.lite_llm,
+# Apache-2.0); see NOTICE.
 _CONTEXT_LENGTH_ERROR_PHRASES = (
     "context length exceeded",
     "context_length_exceeded",

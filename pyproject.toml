@@ -5,6 +5,7 @@ description = "Proximus: a long-horizon coding agent for upstream Harbor."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+authors = [{ name = "Proximal AI, Inc." }]
 license-files = ["LICENSE", "NOTICE"]
 dependencies = [
     "harbor==0.23.0",

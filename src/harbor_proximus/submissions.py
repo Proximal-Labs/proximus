@@ -84,7 +84,7 @@ class Submissions:
     async def ensure_git(self) -> None:
         """Make the workspace a git repository."""
         result = await self._git_exec(
-            utils.read_template("ensure_git.sh"),
+            utils.read_script("ensure_git.sh"),
             {
                 "wd": self._workdir,
                 # Newline-joined: gitwildmatch patterns cannot contain
@@ -156,7 +156,7 @@ class Submissions:
         match" so confirm records a fresh snapshot."""
         try:
             result = await self._git_exec(
-                utils.read_template("matches_winner.sh"),
+                utils.read_script("matches_winner.sh"),
                 {"wd": self._workdir, "winner": winner, "commit": ref},
                 self._submission_timeout_sec,
             )
@@ -173,7 +173,7 @@ class Submissions:
         guidance."""
         try:
             result = await self._git_exec(
-                utils.read_template("record_commit.sh"),
+                utils.read_script("record_commit.sh"),
                 {"wd": self._workdir, "commit": ref, "idx": str(int(index))},
                 self._submission_timeout_sec,
             )
@@ -263,7 +263,7 @@ class Submissions:
             return False
         try:
             result = await self._git_exec(
-                utils.read_template("restore_winner.sh"),
+                utils.read_script("restore_winner.sh"),
                 {"wd": self._workdir, "winner": winner},
                 RESTORE_TIMEOUT_SEC,
             )

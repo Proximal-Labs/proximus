@@ -75,15 +75,15 @@ def test_preflight_validates_agent_options():
 
 
 def test_all_shell_and_prompt_resources_present():
+    assert utils.read_template("system.md").strip()
     for name in [
-        "system.md",
         "ensure_git.sh",
         "record_commit.sh",
         "matches_winner.sh",
         "restore_winner.sh",
         "reanchor_timer.sh",
     ]:
-        assert utils.read_template(name).strip()
+        assert utils.read_script(name).strip()
 
 
 def test_user_registry_controls_context_and_vision(tmp_path):

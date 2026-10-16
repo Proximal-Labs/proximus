@@ -126,13 +126,11 @@ class CustomProximus(Proximus):
     def summary_request(self) -> str:
         return "Summarize briefly."
 
-    def build_tools(self) -> list[tools.Tool]:
-        return [
-            *super().build_tools(),
-            tools.Tool(
-                "count_lines", "Count lines in a file.", CountArgs, self._count_lines
-            ),
-        ]
+    def build_tools(self) -> dict[str, tools.Tool]:
+        count = tools.Tool(
+            "count_lines", "Count lines in a file.", CountArgs, self._count_lines
+        )
+        return {**super().build_tools(), count.name: count}
 
     async def _count_lines(self, args: CountArgs) -> tools.ToolResult:
         result = await self.environment.exec(f"wc -l {args.path}", timeout_sec=30)

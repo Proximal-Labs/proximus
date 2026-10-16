@@ -5,7 +5,9 @@ from harbor.agents.options import AgentOptions
 from harbor.utils.templating import render_prompt_template
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
-# Margin the loop reserves against the time budget for one last operation.
+# Seconds kept free at the end of the time budget: bash commands time out this
+# long before the budget runs out, and a model request always gets at least
+# this long, so the run can still finish cleanly.
 BUDGET_MARGIN_SEC = 120
 
 
@@ -13,123 +15,96 @@ class ProximusConfig(AgentOptions):
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
     time_budget_sec: float | None = None
-    """Wall-clock budget; enables the in-sandbox deadline file and the
-    time-left line in submit responses. ``override_timeout_sec`` must sit
-    comfortably ABOVE this so the loop ends gracefully before the
-    orchestrator's kill."""
+    """Total time budget in seconds. The run stops when it is used up, whatever
+    any task timer says. Set Harbor's hard agent timeout higher (see
+    ``hard_timeout_sec``) so the exit submit and restore can finish."""
 
     submission_timeout_sec: int = 600
-    """Maximum time for an in-sandbox submission Git operation. Large model
-    artifacts can take several minutes to stage and commit; the old 60-second
-    ceiling could kill ``git add`` mid-write and leave no winning submission."""
+    """Seconds allowed for one submission's git work in the sandbox. Large
+    workspaces can take minutes to commit."""
 
     auto_submit_on_exit: bool = True
-    """At run end, pin the live workspace as a final submission via the same
-    path as an argless ``submit()`` — recorded in ``submissions.jsonl``
-    (flagged ``auto``), graded like any other submission. Skipped when the
-    tree already matches the newest submission, so a clean double-submit
-    ending never grows a duplicate. This is what
-    makes a timed-out run gradeable at its last state."""
+    """When the run ends, save any unsubmitted work as a final submission, so a
+    run that times out is still graded on its last state. Skipped if nothing
+    changed since the last submission."""
 
     restore_on_exit: bool = True
-    """At run end, check out the winning submission so the verifier, and
-    Harbor's capture of the workspace, see the submitted tree. Set
-    False only when grading runs offline from the pinned refs: the
-    workspace is then left at kill-time state and every scoring consumer
-    must go through the pins."""
+    """When the run ends, check out the winning submission so the verifier sees
+    it. Turn off only if grading reads the submitted commits directly; the
+    workspace is then left as it was when the run stopped."""
 
     finalize_only_on_submit: bool = False
-    """When true, the exit restore (and auto-submit) runs only after a
-    confirmed model submit. Budget, stall, provider, and environment-loss
-    endings stay ungradeable."""
+    """Do the exit submit and restore only if the model confirmed a submission.
+    Runs that end any other way (time out, stall, error) are left as they are."""
 
     task_provides_timer: bool = False
-    """The task instruction owns the timer story (e.g. FrontierSWE's
-    ``sandbox-timer``). When True, Proximus writes no deadline file and the
-    system prompt defers to the task's timer instead of introducing a
-    second clock — but the task timer still gets RE-ANCHORED to the budget
-    (untouched it counts the sandbox's hard timeout, and the instruction's
-    clock must tell the truth). ``time_budget_sec`` still paces the loop."""
+    """Set when the task instruction already tells the model how to check the
+    time (for example FrontierSWE's ``sandbox-timer``). Only changes what the
+    model is told: Proximus skips its own deadline file and points the model to
+    the task's timer. The run still ends at ``time_budget_sec``, and the task's
+    timer is reset to show the same remaining time either way."""
 
     reasoning_effort: str | None = None
-    """Optional reasoning effort. ``drop_params`` does not sanitize invalid
-    values: an unsupported value (e.g. ``max`` on gpt-5.5) is still a 400."""
+    """Reasoning effort passed to the model. A value the model does not
+    support is rejected by the provider."""
 
     api_key_env: str | None = None
-    """Name of the environment variable holding this model's API key. litellm
-    resolves keys by PROVIDER PREFIX (everything on the ``openai/`` route reads
-    ``OPENAI_API_KEY``), so two OpenAI-compatible endpoints can otherwise
-    compete for the same variable. Naming the variable here (never the key
-    itself: agent configs are saved with the run's results) lets every model
-    carry its own credential.
-    Read from Harbor's agent env first, then the host. Without it, the
-    provider's usual key variable (e.g. ``ANTHROPIC_API_KEY``) is taken from the
-    agent env, else LiteLLM reads it from the host; base URLs (e.g.
-    ``OPENAI_BASE_URL``) follow the same rule either way. Variables taken from
-    the agent env are blanked in the sandbox for the run."""
+    """Name of the environment variable that holds this model's API key (never
+    the key itself). Use it when two models share a provider route but need
+    different keys. Read from Harbor's agent env first, then the host. Without
+    it, the provider's usual variable is used."""
 
     workspace_git_excludes: list[str] = Field(default_factory=list)
-    """Gitwildmatch patterns written to the workspace repo's
-    ``.git/info/exclude`` at git bootstrap (and already-tracked matches
-    untracked), BEFORE the baseline commit. Sourced from the task's ``/app``
-    artifacts exclude list: grading quarantines those paths anyway, so
-    letting them into commits only bloats every submission and the model's
-    own ``git status``. ``.git/info/exclude``
-    rather than ``.gitignore`` so the agent-visible tree is untouched."""
+    """Paths that submissions never commit, in ``.gitignore`` syntax (for
+    example caches and checkpoints that grading ignores anyway). Written to
+    ``.git/info/exclude``, so the visible workspace is unchanged."""
 
     litellm_model_info: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    """Registry entries merged into litellm's global model map at LLM init
-    (``litellm.register_model``), for models litellm does not ship. The
-    registry gates three behaviors: the context limit (unknown model falls
-    back to 200K), the ``view_image`` tool (unknown means no vision, tool
-    removed), and per-turn cost telemetry (unknown prices as $0). Values
-    follow litellm's model-map schema (``max_input_tokens``,
-    ``input_cost_per_token``, ``supports_vision``, ...). openai-route models
-    need BOTH keys: the prefixed handle (``openai/test-model`` — read by
-    ``get_model_info``/``supports_vision`` at init) and the bare name
-    (``test-model`` — echoed in responses, prices the cost calculator)."""
+    """Extra LiteLLM model entries, keyed by model name, for models LiteLLM
+    does not know. They set the context limit, vision support (needed for
+    ``view_image``) and prices. Unknown models get 200K context, no vision and
+    zero cost. For an ``openai/`` route, add both ``openai/<model>`` and
+    ``<model>``. ``model_info`` is the shorthand for the run's model."""
 
     llm_call_kwargs: dict[str, Any] = Field(default_factory=dict)
-    """Extra kwargs forwarded to ``litellm.acompletion`` (temperature,
-    max_tokens, api_base, timeout, ...). They win over every other request
-    setting, including ``temperature``, ``api_base`` and
-    ``max_thinking_tokens``."""
+    """Extra arguments for every model request (for example ``max_tokens``,
+    ``timeout`` or ``extra_body``). They override all other request settings."""
 
     # Options below follow Harbor's Terminus 2 names. Unset, each one keeps
     # the default behavior.
 
     max_turns: int | None = Field(default=None, ge=1)
-    """Maximum agent turns. Omit for no limit. Reaching it ends the run like
-    an expired time budget, with the usual exit auto-submit and restore."""
+    """Maximum number of loop iterations, including retries. Reaching it ends
+    the run like a time-out, with the usual exit submit and restore."""
 
     enable_summarize: bool = True
-    """Compact the conversation into a handoff summary near the context
-    limit. When false, a context overflow ends the run with an error."""
+    """Summarize the conversation when it nears the context limit. When off, a
+    full context window ends the run with an error."""
 
     compaction_threshold: float = Field(default=0.85, gt=0, le=1)
-    """Fraction of the context limit at which the conversation is compacted."""
+    """Fraction of the context limit at which the conversation is summarized."""
 
     disallowed_tools: list[str] = Field(default_factory=list)
-    """Tools removed from the model's tool set, e.g. ``list_submissions`` or
-    ``view_image``. ``bash`` and ``submit`` cannot be removed."""
+    """Tools to remove: ``list_submissions`` or ``view_image``. ``bash`` and
+    ``submit`` are always available."""
 
     prompt_template_path: str | None = None
-    """Jinja2 template wrapping the task instruction; must include
-    ``{{ instruction }}``. Same as Harbor's installed agents."""
+    """Jinja2 template around the task instruction. It must contain
+    ``{{ instruction }}``."""
 
     temperature: float | None = None
-    """Sampling temperature. Omit to use the backend default."""
+    """Sampling temperature. Omit to use the provider's default."""
 
     api_base: str | None = None
-    """LLM API base URL."""
+    """Base URL of the model API."""
 
     max_thinking_tokens: int | None = Field(default=None, ge=1024)
-    """Anthropic extended-thinking budget (min 1024). Omit for the model default."""
+    """Thinking budget for Anthropic models (at least 1024). Cannot be combined
+    with ``reasoning_effort``."""
 
     model_info: dict[str, Any] | None = None
-    """LiteLLM model info for the run's model (context limit, prices,
-    vision), for models LiteLLM does not ship. Shorthand for a
-    ``litellm_model_info`` entry under both the prefixed and bare model name."""
+    """LiteLLM model info for the run's model (context limit, vision, prices),
+    for models LiteLLM does not know."""
 
     @field_validator("prompt_template_path")
     @classmethod
@@ -137,9 +112,8 @@ class ProximusConfig(AgentOptions):
         if value is not None:
             if not Path(value).is_file():
                 raise ValueError(f"prompt_template_path not found: {value}")
-            render_prompt_template(
-                Path(value), "instruction"
-            )  # needs {{ instruction }}
+            # Raises unless the template uses {{ instruction }}.
+            render_prompt_template(Path(value), "instruction")
         return value
 
     @model_validator(mode="after")

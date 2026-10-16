@@ -3,11 +3,17 @@
 import logging
 from pathlib import Path
 
-_TEMPLATES_DIR = Path(__file__).parent / "templates"
+_PACKAGE_DIR = Path(__file__).parent
 
 
 def read_template(name: str) -> str:
-    return (_TEMPLATES_DIR / name).read_text()
+    """A prompt template from ``templates/``."""
+    return (_PACKAGE_DIR / "templates" / name).read_text()
+
+
+def read_script(name: str) -> str:
+    """A shell script from ``scripts/``, run in the sandbox as is."""
+    return (_PACKAGE_DIR / "scripts" / name).read_text()
 
 
 def write_artifact(

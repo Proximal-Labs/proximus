@@ -39,7 +39,7 @@ async def reanchor(
     a restarted legacy ``/app/timer.sh``) seeded with ``remaining_sec`` so
     its countdown means "seconds until this run ends" rather than the hard
     timeout from container start."""
-    script = utils.read_template("reanchor_timer.sh")
+    script = utils.read_script("reanchor_timer.sh")
     command = f"remaining={remaining_sec}; missing={_TIMER_MISSING};\n{script}"
     try:
         result = await environment.exec(command, timeout_sec=60)

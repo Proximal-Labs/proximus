@@ -1,8 +1,12 @@
 Proximus (harbor-proximus)
-Copyright 2026 Proximal Labs
+Copyright 2026 Proximal AI, Inc.
 
-Licensed under the Apache License, Version 2.0; see LICENSE.
+This product is licensed under the Apache License, Version 2.0; see LICENSE.
 
 Proximus is an agent for Harbor (https://pypi.org/project/harbor/), which is
-distributed separately under its own license. This package depends on Harbor
-and does not include Harbor source code.
+distributed separately. This product includes code adapted from Harbor,
+licensed under the Apache License, Version 2.0:
+
+  - src/harbor_proximus/llm.py: the context-length error check
+    (is_context_length_error), adapted from harbor.llms.lite_llm in Harbor
+    0.23.0.

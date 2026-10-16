@@ -582,10 +582,11 @@ class Proximus(BaseAgent):
         """The request for a handoff summary when the conversation is compacted."""
         return prompts.SUMMARY_REQUEST
 
-    def build_tools(self) -> list[tools.Tool]:
-        """The model's tools. Called once, at construction; ``disallowed_tools``
-        then removes tools by name. A subclass may add tools whose handlers
-        run commands through ``self.environment`` during the run."""
+    def build_tools(self) -> dict[str, tools.Tool]:
+        """The model's tools, keyed by name. Called once, at construction;
+        ``disallowed_tools`` then removes tools by name. A subclass may add or
+        replace tools; their handlers can run commands through
+        ``self.environment`` during the run."""
         surface = [
             tools.Tool("bash", tools.BASH_DESCRIPTION, tools.BashArgs, self._bash),
             tools.Tool(
@@ -606,17 +607,14 @@ class Proximus(BaseAgent):
         ]
         if not self._llm.supports_vision():
             surface = [tool for tool in surface if tool.name != "view_image"]
-        return surface
+        return {tool.name: tool for tool in surface}
 
     @property
     def environment(self) -> BaseEnvironment:
         """The task sandbox of the current run."""
         return self._environment
 
-    def _filter_tools(self, surface: list[tools.Tool]) -> dict[str, tools.Tool]:
-        by_name = {tool.name: tool for tool in surface}
-        if len(by_name) != len(surface):
-            raise ValueError("build_tools() returned duplicate tool names")
+    def _filter_tools(self, by_name: dict[str, tools.Tool]) -> dict[str, tools.Tool]:
         removed = set(self.config.disallowed_tools)
         if removed & {"bash", "submit"}:
             raise ValueError("disallowed_tools cannot remove bash or submit")
