@@ -1,0 +1,8 @@
+Proximus (harbor-proximus)
+Copyright 2026 Proximal Labs
+
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+Proximus is an agent for Harbor (https://pypi.org/project/harbor/), which is
+distributed separately under its own license. This package depends on Harbor
+and does not include Harbor source code.

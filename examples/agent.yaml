@@ -1,0 +1,15 @@
+# Agent section to merge into a Harbor job with your own tasks and environment.
+# Install the local wheel in the same Python environment as Harbor first.
+agents:
+  - import_path: harbor_proximus:Proximus
+    model_name: openai/gpt-5.4
+    # Work budget plus room for the exit submit and restore
+    # (harbor_proximus.hard_timeout_sec gives 8400 for these kwargs).
+    override_timeout_sec: 8400
+    kwargs:
+      time_budget_sec: 7200
+      reasoning_effort: high
+      # Use this only when the task instruction already describes its own timer.
+      task_provides_timer: true
+      # Host-side provider credential; export its value before launching Harbor.
+      api_key_env: OPENAI_API_KEY
