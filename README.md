@@ -39,8 +39,10 @@ harbor run ... --agent harbor_proximus:Proximus --model anthropic/claude-opus-5 
 Any LiteLLM model works (`anthropic/…`, `openai/…`, `openrouter/…`, `gemini/…`,
 or `openai/<model>` with `api_base` for OpenAI-compatible endpoints). There are
 no built-in model presets: pass `reasoning_effort`, `llm_call_kwargs` or
-`model_info` as needed. Models LiteLLM does not know default to a 200K context,
-no vision and $0 cost.
+`model_info` as needed. The context limit comes only from LiteLLM's
+`max_input_tokens`. If it is missing or is not a positive integer, construction
+fails: set `model_info={"max_input_tokens": 200000}` to the model's actual limit.
+There is no context fallback. Unknown models default to no vision and $0 cost.
 
 Credentials follow Harbor's own agents: the provider's usual variable
 (`ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`, ...) from Harbor's agent env
@@ -120,11 +122,20 @@ excludes. Invalid options raise `ValueError` before any sandbox starts.
 ```sh
 uv sync --locked
 uv run pytest -q          # offline: fake providers, temporary Git repos
-uv run ruff check src tests scripts
+uv run --locked ruff check src tests scripts
+uv run --locked ruff format --check src tests scripts
 uv build && uv run python scripts/verify_wheel.py dist/harbor_proximus-0.1.0a1-py3-none-any.whl
 ```
 
 `verify_wheel.py` reruns the suite against the installed wheel outside the
 checkout; `--litellm-version 1.97.0` checks the lower bound.
+
+### Formatting and lint
+We use ruff.
+
+```sh
+uv run --locked ruff check --fix src tests scripts
+uv run --locked ruff format src tests scripts
+```
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

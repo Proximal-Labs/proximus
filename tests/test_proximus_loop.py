@@ -978,6 +978,78 @@ async def test_image_does_not_split_tool_result_block(tmp_path, monkeypatch):
     assert messages[idx + 3]["content"][0]["type"] == "image_url"
 
 
+@pytest.mark.parametrize("fail_first_save", [False, True])
+async def test_image_batch_requests_and_archive_numbering(
+    tmp_path, monkeypatch, fail_first_save
+):
+    import base64
+    import copy
+    from pathlib import Path
+
+    def view_batch(*names):
+        return FakeResponse(
+            FakeMessage(
+                content="Inspect images.",
+                tool_calls=[
+                    FakeToolCall(
+                        name, "view_image", json.dumps({"path": f"/app/{name}.png"})
+                    )
+                    for name in names
+                ],
+            )
+        )
+
+    fake = FakeCompletion([view_batch("a", "b"), view_batch("c"), *finish_responses()])
+    requests = []
+
+    async def complete(**kwargs):
+        requests.append(copy.deepcopy(kwargs["messages"]))
+        return await fake(**kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    png = make_tiny_png()
+
+    class ImageEnv(FakeEnv):
+        async def download_file(self, source_path, target_path):
+            Path(target_path).write_bytes(png)
+
+    agent = make_agent(tmp_path)
+    write_bytes = Path.write_bytes
+
+    def save_bytes(path, data):
+        if fail_first_save and path == agent.logs_dir / "images/turn0001-00.png":
+            raise OSError("image archive write failed")
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", save_bytes)
+    await agent.run("Task", ImageEnv(), AgentContext())  # type: ignore[arg-type]
+
+    part = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(png).decode()}"},
+    }
+    assert [message["role"] for message in requests[1][-3:]] == ["tool", "tool", "user"]
+    assert [message["tool_call_id"] for message in requests[1][-3:-1]] == ["a", "b"]
+    assert requests[1][-1] == {"role": "user", "content": [part, part]}
+    assert requests[2][-1] == {"role": "user", "content": [part]}
+
+    first_batch = ["images/turn0001-01.png"]
+    if not fail_first_save:
+        first_batch.insert(0, "images/turn0001-00.png")
+    expected = [first_batch, ["images/turn0002-02.png"]]
+    refs = [
+        step["extra"]["images"]
+        for step in read_trajectory(agent)["steps"]
+        if (step.get("extra") or {}).get("images")
+    ]
+    assert refs == expected
+    assert agent._run.n_images == 3
+    for batch in expected:
+        for path in batch:
+            assert (agent.logs_dir / path).read_bytes() == png
+
+
 def make_tiny_png() -> bytes:
     import io
 
@@ -1687,7 +1759,11 @@ async def test_xai_responses_request_keeps_system(tmp_path, monkeypatch):
     monkeypatch.setattr(
         litellm,
         "get_model_info",
-        lambda model: {"mode": "responses", "litellm_provider": "xai"},
+        lambda model: {
+            "mode": "responses",
+            "litellm_provider": "xai",
+            "max_input_tokens": 200_000,
+        },
     )
 
     agent = Proximus(

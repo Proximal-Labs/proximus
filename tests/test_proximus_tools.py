@@ -493,9 +493,9 @@ class TestViewImage:
         assert "call view_image again" in result.content
 
     async def test_encoded_byte_ceiling_enforced(self, monkeypatch):
-        from harbor_proximus import tools as tools_module
+        from harbor_proximus import images
 
-        monkeypatch.setattr(tools_module, "_IMAGE_MAX_ENCODED_BYTES", 64)
+        monkeypatch.setattr(images, "MAX_ENCODED_BYTES", 64)
         env = FakeEnv()
         env.download_bytes = make_png(64, 64)
         result = await make_executor(env).view_image(

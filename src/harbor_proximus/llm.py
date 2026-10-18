@@ -402,7 +402,6 @@ LLM_RETRIES = 12
 LLM_RETRY_MAX_WAIT_SEC = 300.0
 # Per request timeout: 30 mins
 LLM_TIMEOUT_SEC = 1800.0
-_FALLBACK_CONTEXT_LIMIT = 200_000
 _SECRET_TOKEN_RE = re.compile(r"\b(?:ak|sk)-[A-Za-z0-9_-]+\b")
 
 
@@ -716,22 +715,15 @@ class LLM:
         self.session_id: str = ""
 
     def resolve_context_limit(self) -> int:
-        """the longest limit the registry reports"""
+        error = f"No valid max_input_tokens for {self.model_name!r}."
         try:
             info = litellm.get_model_info(self.model_name)
-            limit = max(
-                int(info.get("max_input_tokens") or 0),
-                int(info.get("max_tokens") or 0),
-            )
-            if limit:
-                return limit
         except Exception as e:
-            self._logger.debug(f"Could not resolve context limit: {e}")
-        self._logger.debug(
-            f"Using fallback context limit {_FALLBACK_CONTEXT_LIMIT} for "
-            f"{self.model_name}"
-        )
-        return _FALLBACK_CONTEXT_LIMIT
+            raise ValueError(error) from e
+        limit = info.get("max_input_tokens")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError(error)
+        return limit
 
     def supports_vision(self) -> bool:
         try:
@@ -741,8 +733,7 @@ class LLM:
             return False
 
     def is_anthropic(self) -> bool:
-        model = self.model_name.lower()
-        return "anthropic" in model
+        return any(x in self.model_name.lower() for x in ("anthropic", "claude"))
 
     def is_xai(self) -> bool:
         if "xai" in self.model_name.lower():
