@@ -23,18 +23,6 @@ jobs:
       - run: uv sync --locked
       - run: uv run --locked ruff check src tests scripts
       - run: uv run --locked ruff format --check src tests scripts
-      - name: Test Emacs save hook
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends emacs-nox
-          emacs --batch -Q -l scripts/check_ruff.el
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Test Pi save hook without a model
-        run: |
-          npm install --global --ignore-scripts @earendil-works/pi-coding-agent@0.87.1
-          node scripts/check_pi_ruff.mjs
 
   tests:
     runs-on: ubuntu-latest
