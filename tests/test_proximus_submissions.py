@@ -208,10 +208,10 @@ async def test_submit_resolves_and_pins_the_ref(tmp_path: Path):
     # The ref is resolved to a full SHA NOW (HEAD moves, short hashes and
     # branch names drift) and pinned under refs/proximus/submissions/ so
     # a later rebase/reset or `git gc` cannot make it unreachable before
-    # the trial's end-of-run snapshot.
+    # the end-of-run workspace capture.
     assert 'git rev-parse -q --verify "$commit^{commit}"' in command
     assert 'git update-ref "refs/proximus/submissions/$idx"' in command
-    # Nothing is copied: no snapshot dir, no rsync, no archive.
+    # Nothing is copied: no copy dir, no rsync, no archive.
     assert "rsync" not in command
     assert "git archive" not in command
     assert call["timeout_sec"] == DEFAULT_SUBMISSION_TIMEOUT_SEC

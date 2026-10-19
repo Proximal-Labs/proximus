@@ -432,7 +432,7 @@ async def test_plain_submit_records_and_continues(tmp_path, monkeypatch):
     # Two record calls (the confirm resolves the same commit and reuses,
     # recording nothing), then exactly one command after the loop: the
     # end-of-run restore checks out the winning (newest pinned) commit so
-    # the verifier and the snapshot score the submitted tree, keeping the
+    # the verifier and the workspace capture see the submitted tree, keeping the
     # pre-restore HEAD reachable via refs/proximus/end-state.
     records = [
         c
