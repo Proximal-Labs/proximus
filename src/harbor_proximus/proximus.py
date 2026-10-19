@@ -6,6 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, override
 
@@ -19,6 +20,7 @@ from harbor.models.task.config import MCPServerConfig
 from harbor.utils.templating import render_prompt_template
 from harbor.utils.trajectory_utils import format_trajectory_json
 
+import harbor_proximus.images as images
 import harbor_proximus.llm as llm
 import harbor_proximus.prompts as prompts
 import harbor_proximus.submissions as submissions
@@ -99,7 +101,8 @@ class Proximus(BaseAgent):
             override_setup_timeout_sec=override_setup_timeout_sec,
             **kwargs,
         )
-        assert isinstance(self.options, ProximusConfig)
+        if not isinstance(self.options, ProximusConfig):
+            raise TypeError("Proximus.options must be ProximusConfig")
         self.config = self.options
         self._llm = llm.LLM(
             model_name,
@@ -123,8 +126,6 @@ class Proximus(BaseAgent):
 
     @override
     def version(self) -> str | None:
-        from importlib.metadata import version
-
         return version("harbor-proximus")
 
     @override
@@ -142,13 +143,16 @@ class Proximus(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        # Harbor overlays the agent env onto every sandbox command. The model
-        # credentials Proximus read from it are for the host-side LLM client
-        # only: blank them in the sandbox (a nested overlay wins).
+        with self._sandbox_credential_scope(environment):
+            await self._run_task(instruction, environment, context)
+
+    def _sandbox_credential_scope(
+        self, environment: BaseEnvironment
+    ) -> contextlib.AbstractContextManager:
+        """Hide host-side model credentials from sandbox commands."""
         hidden = {name: "" for name in sorted(self._llm.consumed_env_keys)}
         scope = getattr(environment, "scoped_exec_env", None)
-        with scope(hidden) if hidden and scope else contextlib.nullcontext():
-            await self._run_task(instruction, environment, context)
+        return scope(hidden) if hidden and scope else contextlib.nullcontext()
 
     async def _run_task(
         self,
@@ -156,7 +160,6 @@ class Proximus(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        """Setup for every run."""
         self._run = RunState()
         self._steps = []
         if self.config.prompt_template_path:
@@ -236,7 +239,7 @@ class Proximus(BaseAgent):
                     raise
                 self.logger.debug("Context window exceeded; compacting.")
                 await self._compact()
-                continue  # retry the turn that overflowed
+                continue
             except OutputLengthExceededError:
                 self.logger.debug("Output length exceeded; asking for smaller output.")
                 self._run.messages.append(
@@ -244,14 +247,10 @@ class Proximus(BaseAgent):
                 )
                 continue
             except llm.ImageLimitExceededError:
-                # A hard image-count cap means retaining 49/50 old images only
-                # postpones the next failure. Rewriting even one image already
-                # invalidates the cached prefix, so clear image payloads and
-                # compact once: the summary preserves the model's textual
-                # findings while the trajectory keeps the viewed image files.
-                evicted = self._evict_all_images()
+                # Clear all images to avoid repeatedly hitting the image-count cap.
+                evicted = images.evict_all(self._run.messages)
                 if not evicted:
-                    raise  # a claimed image limit with no images is not repairable
+                    raise
                 self.logger.debug(
                     "Provider image-count limit exceeded; removed %d images "
                     "and compacting context.",
@@ -259,14 +258,13 @@ class Proximus(BaseAgent):
                 )
                 if self.config.enable_summarize:
                     await self._compact()
-                continue  # retry the rejected turn with compacted history
+                continue
             except llm.InvalidImageError as e:
-                # The provider rejected an attached image before the model
-                # could see this turn. Remove the newest image (the one just
-                # returned by view_image), then relay the exact error so the
-                # model can resize/pad/repair the source and view it again.
-                if not self._evict_newest_image(self._INVALID_IMAGE_EVICTED_NOTE):
-                    raise  # no attached image means the request is not repairable here
+                # Remove the latest image so the model can repair and reload it.
+                if not images.evict_newest(
+                    self._run.messages, images.INVALID_IMAGE_NOTE
+                ):
+                    raise
                 self.logger.debug(
                     "Provider rejected the newest attached image; removed it "
                     "and informed the model."
@@ -277,27 +275,17 @@ class Proximus(BaseAgent):
                         "content": prompts.INVALID_IMAGE_MESSAGE.format(error=e),
                     }
                 )
-                continue  # retry without the rejected payload
+                continue
             except llm.RequestTooLargeError as e:
-                # A gateway body cap (not the token window): the oversized
-                # payload is the WHOLE history, so no message can reach the
-                # model until the history shrinks. Evict the NEWEST attached
-                # image (images are the only mass that can outgrow the cap
-                # under a model's context limit) and relay the provider
-                # error — the model can crop/compress the file and view it
-                # again. Newest-first costs the least prompt cache: the
-                # prefix cache is busted only from the edited position, and
-                # everything before the last image stays cached. Still too
-                # large -> the next round evicts the next-newest.
-                if not self._evict_newest_image():
-                    raise  # nothing evictable made the request oversized
+                # Remove newest images first to preserve more of the prompt cache.
+                if not images.evict_newest(self._run.messages):
+                    raise
                 self.logger.debug(
                     "Request exceeded the provider body cap; evicted the "
                     "newest attached image and informed the model."
                 )
                 note = prompts.REQUEST_TOO_LARGE_MESSAGE.format(error=e)
-                # Consecutive evictions in one recovery burst update the
-                # existing note instead of stacking new user messages.
+                # Reuse the recovery note across consecutive failures.
                 last = self._run.messages[-1]
                 if last.get("role") == "user" and str(last.get("content")).startswith(
                     "Request failed: "
@@ -305,14 +293,11 @@ class Proximus(BaseAgent):
                     last["content"] = note
                 else:
                     self._run.messages.append({"role": "user", "content": note})
-                continue  # retry the turn with the slimmed history
+                continue
             except Exception as e:
                 budget = self.config.time_budget_sec
                 if budget and self._elapsed() >= budget and llm._is_retryable(e):
-                    # The retry loop was stopped by the BUDGET, not by the
-                    # failure class (a provider down longer than the run had
-                    # left). That is a failed trial: returning cleanly would
-                    # mark it ``done`` and auto-grade a partial pin.
+                    # Fail the trial rather than grade partial work after retries expire.
                     self.logger.debug(
                         "Budget expired during provider retries; failing run."
                     )
@@ -365,17 +350,12 @@ class Proximus(BaseAgent):
         env_gone: tools.EnvironmentGoneError | None = None
         observation_results: list[trajectories.ObservationResult] = []
         atif_tool_calls: list[trajectories.ToolCall] = []
-        pending_images: list[tuple[str, str]] = []
+        pending_images: list[images.Attachment] = []
         saved_images: list[str] = []
 
         for call in parsed.tool_calls:
             disarmed = False
             if call.name != "submit" and self._run.submit_armed_turn is not None:
-                # The confirm protocol requires submit to be the model's next
-                # action; anything else cancels the pending confirmation. A
-                # silent lapse leaves models puzzled ("I submitted twice — why
-                # hasn't it ended?"), so the cancellation is stated on the very
-                # call that caused it.
                 self._run.submit_armed_turn = None
                 disarmed = True
             tool = self._tools.get(call.name)
@@ -424,7 +404,15 @@ class Proximus(BaseAgent):
                 # Deferred: an image message must not split the contiguous
                 # tool results.
                 pending_images.append(result.image)
-                path = self._save_image(*result.image)
+                image_index = self._run.n_images
+                self._run.n_images += 1
+                path = images.save(
+                    result.image,
+                    self.logs_dir,
+                    turn=self._run.n_turns,
+                    index=image_index,
+                    logger=self.logger,
+                )
                 if path:
                     saved_images.append(path)
 
@@ -462,22 +450,7 @@ class Proximus(BaseAgent):
             end_run = True
 
         if pending_images and not end_run:
-            # Providers accept images only in user messages. Never evicted
-            # mid-run: rewriting history busts the prompt cache.
-            self._run.messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{image_b64}"
-                            },
-                        }
-                        for media_type, image_b64 in pending_images
-                    ],
-                }
-            )
+            self._run.messages.append(images.user_message(pending_images))
 
         self._add_agent_step(
             parsed, atif_tool_calls, observation_results, images=saved_images
@@ -488,73 +461,6 @@ class Proximus(BaseAgent):
             raise env_gone
         return end_run
 
-    _IMAGE_EXT = {
-        "image/png": "png",
-        "image/jpeg": "jpg",
-        "image/gif": "gif",
-        "image/webp": "webp",
-    }
-
-    _IMAGE_EVICTED_NOTE = "[image removed: request too large]"
-    _INVALID_IMAGE_EVICTED_NOTE = "[image removed: provider rejected it]"
-
-    def _evict_newest_image(self, note: str | None = None) -> bool:
-        """Replace the LAST attached image in history with a placeholder.
-
-        Recovery for :class:`llm.RequestTooLargeError`: newest-first keeps
-        the most prompt cache (the prefix before the edit stays valid) and
-        targets the image the model can most easily re-view compressed.
-        Returns False when no image remains to evict."""
-        for message in reversed(self._run.messages):
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for i in range(len(content) - 1, -1, -1):
-                part = content[i]
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    content[i] = {
-                        "type": "text",
-                        "text": note or self._IMAGE_EVICTED_NOTE,
-                    }
-                    return True
-        return False
-
-    def _evict_all_images(self) -> int:
-        """Remove all attached image payloads before image-limit compaction.
-
-        The trajectory's saved files remain available, and the model can call
-        ``view_image`` again after the compacted handoff when it needs one.
-        """
-        count = 0
-        for message in self._run.messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for i, part in enumerate(content):
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    content[i] = {"type": "text", "text": self._IMAGE_EVICTED_NOTE}
-                    count += 1
-        return count
-
-    def _save_image(self, media_type: str, image_b64: str) -> str | None:
-        """Persist a viewed image under ``<logs_dir>/images/`` and return its
-        RELATIVE path for the trajectory step — the only copy otherwise is the
-        base64 blob inside messages.json. Best-effort: a failed write costs the
-        archive one image, never the run."""
-        import base64
-
-        ext = self._IMAGE_EXT.get(media_type, "bin")
-        name = f"turn{self._run.n_turns:04d}-{self._run.n_images:02d}.{ext}"
-        self._run.n_images += 1
-        try:
-            path = self.logs_dir / "images" / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(base64.b64decode(image_b64))
-        except (OSError, ValueError) as e:
-            self.logger.debug(f"Could not save viewed image {name}: {e}")
-            return None
-        return f"images/{name}"
-
     # ----- tools -----
     # Handlers delegate through self: the tool surface exists from
     # construction, while the executor and submissions bind in run().
@@ -564,7 +470,6 @@ class Proximus(BaseAgent):
     # the way Harbor agents are customized.
 
     def system_prompt(self) -> str:
-        """The system prompt. Called once, at construction."""
         return prompts.system_prompt(self.config.task_provides_timer)
 
     def initial_message(

@@ -1,4 +1,3 @@
-import base64
 import json
 import tempfile
 import time
@@ -10,6 +9,7 @@ from typing import Any
 from harbor.environments.base import BaseEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+import harbor_proximus.images as images
 from harbor_proximus.config import BUDGET_MARGIN_SEC
 
 
@@ -82,78 +82,6 @@ EXEC_ENV: dict[str, str] = {
     "DEBIAN_FRONTEND": "noninteractive",
 }
 
-# Strictest caps across provider vision docs: 2000px long edge, 4MB base64.
-_IMAGE_MAX_DIMENSION = 2000
-_IMAGE_MAX_ENCODED_BYTES = 4 * 1024 * 1024
-_IMAGE_MAX_RAW_BYTES = _IMAGE_MAX_ENCODED_BYTES * 3 // 4  # base64 inflates 4/3
-# EXIF tag 274 ("Orientation"); hardcoded to avoid importing PIL at module load.
-_EXIF_ORIENTATION = 0x0112
-
-
-def _sniff_media_type(data: bytes) -> str | None:
-    """Detect the image format from magic bytes; extensions are never
-    trusted (providers reject mismatched media types)."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def _normalize_image(data: bytes, media_type: str) -> tuple[bytes, str, str]:
-    """Apply EXIF orientation and downscale to fit provider limits; returns
-    (data, media_type, note). Falls back to the original bytes only when
-    Pillow cannot be imported (it is a declared dependency). Invalid image data raises ValueError so callers
-    can report a recoverable tool error instead of sending it to a provider."""
-    try:
-        import io
-
-        from PIL import Image, ImageOps
-    except ImportError:
-        return data, media_type, ""
-
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            # Image.open() is lazy and may accept a valid header around an
-            # invalid pixel stream. Force decoding before returning unchanged.
-            img.load()
-            orientation = img.getexif().get(_EXIF_ORIENTATION, 1)
-            needs_transpose = orientation != 1
-            width, height = img.size
-            if (
-                not needs_transpose
-                and max(width, height) <= _IMAGE_MAX_DIMENSION
-                and len(data) <= _IMAGE_MAX_RAW_BYTES
-            ):
-                return data, media_type, ""
-            if needs_transpose:
-                img = ImageOps.exif_transpose(img)
-                width, height = img.size
-            scale = min(1.0, _IMAGE_MAX_DIMENSION / max(width, height))
-            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-            resized = img.convert("RGB") if img.mode not in ("RGB", "L") else img
-            if new_size != (width, height):
-                resized = resized.resize(new_size, Image.Resampling.LANCZOS)
-            buffer = io.BytesIO()
-            resized.save(buffer, format="JPEG", quality=85)
-            notes = []
-            if needs_transpose:
-                notes.append("EXIF orientation applied")
-            if new_size != (width, height):
-                notes.append(
-                    f"downscaled from {width}x{height} to {new_size[0]}x{new_size[1]}"
-                )
-            if not notes:
-                notes.append("re-encoded as JPEG to fit byte limits")
-            note = ", " + ", ".join(notes)
-            return buffer.getvalue(), "image/jpeg", note
-    except Exception as e:
-        raise ValueError(f"image decoder rejected the file: {e}") from e
-
 
 @dataclass
 class ToolResult:
@@ -161,7 +89,7 @@ class ToolResult:
     is_error: bool = False
     # (media_type, base64_data) — attached to the conversation as an image
     # content block by the agent loop (kept out of the ATIF trajectory).
-    image: tuple[str, str] | None = None
+    image: images.Attachment | None = None
     # Set only by a confirmed final submission.
     ends_run: bool = False
 
@@ -419,35 +347,11 @@ class ToolExecutor:
                 raise_if_environment_gone(e)
                 return ToolResult(f"Could not read {path}: {e}", is_error=True)
 
-        media_type = _sniff_media_type(data)
-        if media_type is None:
-            return ToolResult(
-                f"{path} is not a recognized image (format is detected from "
-                "file content, not the extension). Supported: gif, jpeg, "
-                "png, webp.",
-                is_error=True,
-            )
         try:
-            data, media_type, scale_note = _normalize_image(data, media_type)
+            content, image = images.prepare(data, path)
         except ValueError as e:
-            return ToolResult(
-                f"Could not decode {path}: {e}. Regenerate or convert it with "
-                "a standard image encoder, then call view_image again.",
-                is_error=True,
-            )
-        encoded = base64.b64encode(data).decode()
-        if len(encoded) > _IMAGE_MAX_ENCODED_BYTES:
-            return ToolResult(
-                f"{path} is {len(encoded) // 1024} KB encoded after "
-                f"downscaling, above the {_IMAGE_MAX_ENCODED_BYTES // 1024} KB "
-                "attachment limit. Reduce it first (e.g. crop or convert with "
-                "PIL via bash).",
-                is_error=True,
-            )
-        return ToolResult(
-            f"Attached image {path} ({len(data) // 1024} KB{scale_note}).",
-            image=(media_type, encoded),
-        )
+            return ToolResult(str(e), is_error=True)
+        return ToolResult(content, image=image)
 
     def _clamp_timeout(self, timeout_sec: int) -> int:
         timeout = min(timeout_sec, MAX_TIMEOUT_SEC)

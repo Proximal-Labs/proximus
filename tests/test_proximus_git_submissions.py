@@ -2,9 +2,9 @@
 resolves the given ref (default HEAD) to a full SHA and pins it under
 refs/proximus/submissions/; setup ensures a repository exists; the read-only
 ``list_submissions`` tool shows the store. Nothing is copied at submit time —
-durability is the trial's end-of-run filesystem snapshot, which carries the
-workspace ``.git``; at run end the winner is checked out so the verifier and
-the snapshot score the submitted tree."""
+durability is whatever end-of-run workspace capture the runner does, which
+carries the workspace ``.git``; at run end the winner is checked out so the
+verifier and that capture see the submitted tree."""
 
 import json
 import logging
@@ -137,7 +137,7 @@ async def test_submit_records_pins_and_confirms(tmp_path, monkeypatch):
 
     # Bare submit snapshots the live workspace (empty/HEAD), and the record
     # snippet pins the commit so a later rebase/reset or git gc cannot make
-    # it unreachable before the trial's end-of-run snapshot.
+    # it unreachable before the end-of-run workspace capture.
     records = [
         (c, e)
         for c, e in zip(env.all_commands, env.all_envs)
@@ -159,7 +159,7 @@ async def test_submit_records_pins_and_confirms(tmp_path, monkeypatch):
     assert "Final submission confirmed" in tools[1]
 
     # One command runs after the loop: the end-of-run restore checks out
-    # the winner so the verifier and the snapshot score the submitted tree.
+    # the winner so the verifier and the workspace capture see the submitted tree.
     # It pins the pre-restore HEAD (end-state) and never resets hard.
     restore = env.all_commands[-1]
     assert "refs/proximus/end-state" in restore
@@ -386,7 +386,7 @@ async def test_restore_winner_is_a_noop_without_a_submission(tmp_path):
 
 async def test_restore_on_exit_false_keeps_kill_time_state(tmp_path, monkeypatch):
     # Offline-grading mode: pinning and telemetry are unchanged, but no
-    # restore command reaches the sandbox — the snapshot must carry the
+    # restore command reaches the sandbox — the workspace capture carries the
     # kill-time workspace, and grading goes through the pinned refs.
     fake = FakeCompletion(finish_responses())
     monkeypatch.setattr(litellm, "acompletion", fake)
@@ -450,7 +450,7 @@ async def test_confirm_with_dirty_tree_records_only_the_model_snapshot(
 
 async def test_restore_winner_failure_never_raises(tmp_path, caplog):
     # Exit-path contract: a failed restore is logged, never raised — an
-    # exception here would cost the end-of-run snapshot.
+    # exception here would cost the end-of-run workspace capture.
     class FailingGitEnv(GitEnv):
         async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
             if "refs/proximus/end-state" in command:

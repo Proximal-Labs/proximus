@@ -16,3 +16,11 @@ htmlcov/
 credentials/
 jobs/
 logs/
+
+# Local editor configuration and checks
+/.dir-locals.el
+/.pi/
+/scripts/check_eglot.el
+/scripts/check_pi_ruff.mjs
+/scripts/check_ruff.el
+/scripts/ruff-on-save.el

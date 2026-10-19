@@ -112,6 +112,34 @@ async def test_llm_shorthands_and_llm_call_kwargs_win(tmp_path, monkeypatch):
     assert call["api_base"] == "https://call-kwargs"
 
 
+@pytest.mark.parametrize(
+    ("model_name", "expects_thinking"),
+    [
+        ("anthropic/claude-test", True),
+        ("openai/claude-custom", True),
+        ("openai/Claude-custom", True),
+        ("openai/gpt-test", False),
+    ],
+)
+async def test_thinking_budget_model_names(
+    tmp_path, monkeypatch, model_name, expects_thinking
+):
+    fake = FakeCompletion(finish_responses())
+    monkeypatch.setattr(litellm, "acompletion", fake)
+    agent = Proximus(
+        logs_dir=tmp_path / "logs",
+        model_name=model_name,
+        max_thinking_tokens=2048,
+    )
+    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
+
+    for call in fake.calls:
+        if expects_thinking:
+            assert call["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        else:
+            assert "thinking" not in call
+
+
 class CountArgs(BaseModel):
     path: str
 

@@ -110,10 +110,8 @@ def resolve_credentials(
     return Credentials(api_key, connection.configured_base_url, frozenset(consumed))
 
 
-# Provider error strings that indicate context-window overflow when a backend
-# surfaces it as a generic bad-request error instead of a typed exception.
-# Adapted from Harbor's LiteLLM context-length check (harbor.llms.lite_llm,
-# Apache-2.0); see NOTICE.
+# Provider error strings that indicate context-window overflow
+# Adapted from Harbor's LiteLLM context-length check
 _CONTEXT_LENGTH_ERROR_PHRASES = (
     "context length exceeded",
     "context_length_exceeded",
@@ -137,21 +135,9 @@ def is_context_length_error(error: Exception) -> bool:
     return any(phrase in combined for phrase in _CONTEXT_LENGTH_ERROR_PHRASES)
 
 
-# Gateways cap the serialized request BODY separately from the model's token
-# window (Alibaba token-plan: 10 MiB, undocumented; dashscope-intl: 16 MiB).
-# Because proactive compaction is driven by TOKEN count, an image-heavy history
-# can hit a byte cap far below the token ceiling (an 18 MB transcript can still
-# be hundreds of thousands of tokens clear of the window).
-# Once attached images push the history past the cap, EVERY subsequent call
-# fails — including the one that would tell the model — so the agent loop must
-# repair the history (evict images) before it can report anything.
-# See Proximus._agent_loop.
+# Match provider error text to classify request-size and image-limit errors.
 _REQUEST_TOO_LARGE_PHRASES = (
-    "request body size exceeds",  # Alibaba token-plan gateway (413)
-    # dashscope-intl caps the body at 16 MiB and reports it as a 400 with its
-    # OWN wording, sharing neither the phrase nor the status of the token-plan
-    # hub above, so it needs its own markers. Matching the type as well as the
-    # message keeps the check alive if the prose is reworded.
+    "request body size exceeds",  # Alibaba's 413 error code
     "exceeded limit on max bytes to request body",
     "badrequest.toolarge",
     "requestentitytoolarge",
@@ -229,13 +215,7 @@ def is_request_too_large_error(error: BaseException) -> bool:
 
 
 def is_transient_image_account_error(error: BaseException) -> bool:
-    """Detect Moonshot's temporary image-service account suspension.
-
-    The image backend returns this provider outage as a generic HTTP 400
-    ``BadRequestError`` even though an unchanged request succeeds after the
-    account is restored. Keep the match narrow so genuine image parameter
-    errors still fail immediately.
-    """
+    """Detect Moonshot's temporary image-service account suspension."""
     combined = _error_text(error)
     return all(
         marker in combined
@@ -298,8 +278,7 @@ def _is_retryable(error: BaseException) -> bool:
     if isinstance(error, ProviderRetryBudgetError):
         return False
     if is_responses_unknown_item_error(error):
-        # Same response, same missing message/tool — a replay cannot grow
-        # a choice. Fail the turn instead of burning the budget in sleep.
+        # Same response, same missing message/tool
         return False
     return not isinstance(
         error,
@@ -310,9 +289,6 @@ def _is_retryable(error: BaseException) -> bool:
             InvalidImageError,
             litellm.exceptions.AuthenticationError,
             litellm.exceptions.BadRequestError,
-            # A 404 model-not-found is deterministic misconfiguration (wrong
-            # handle/route/pin) — a replay never passes, and retrying one
-            # only burns silent minutes of the budget.
             litellm.exceptions.NotFoundError,
         ),
     )
@@ -426,7 +402,6 @@ LLM_RETRIES = 12
 LLM_RETRY_MAX_WAIT_SEC = 300.0
 # Per request timeout: 30 mins
 LLM_TIMEOUT_SEC = 1800.0
-_FALLBACK_CONTEXT_LIMIT = 200_000
 _SECRET_TOKEN_RE = re.compile(r"\b(?:ak|sk)-[A-Za-z0-9_-]+\b")
 
 
@@ -740,26 +715,17 @@ class LLM:
         self.session_id: str = ""
 
     def resolve_context_limit(self) -> int:
-        """the longest limit the registry reports"""
+        error = f"No valid max_input_tokens for {self.model_name!r}."
         try:
             info = litellm.get_model_info(self.model_name)
-            limit = max(
-                int(info.get("max_input_tokens") or 0),
-                int(info.get("max_tokens") or 0),
-            )
-            if limit:
-                return limit
         except Exception as e:
-            self._logger.debug(f"Could not resolve context limit: {e}")
-        self._logger.debug(
-            f"Using fallback context limit {_FALLBACK_CONTEXT_LIMIT} for "
-            f"{self.model_name}"
-        )
-        return _FALLBACK_CONTEXT_LIMIT
+            raise ValueError(error) from e
+        limit = info.get("max_input_tokens")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError(error)
+        return limit
 
     def supports_vision(self) -> bool:
-        # A registry hiccup degrades to no-view_image instead of killing
-        # the trial.
         try:
             return litellm.supports_vision(model=self.model_name)
         except Exception as e:
@@ -767,8 +733,7 @@ class LLM:
             return False
 
     def is_anthropic(self) -> bool:
-        model = self.model_name.lower()
-        return "anthropic" in model or "claude" in model
+        return any(x in self.model_name.lower() for x in ("anthropic", "claude"))
 
     def is_xai(self) -> bool:
         if "xai" in self.model_name.lower():

@@ -62,16 +62,14 @@ class ProximusConfig(AgentOptions):
     litellm_model_info: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Extra LiteLLM model entries, keyed by model name, for models LiteLLM
     does not know. They set the context limit, vision support (needed for
-    ``view_image``) and prices. Unknown models get 200K context, no vision and
+    ``view_image``) and prices. A positive integer ``max_input_tokens`` is
+    required; there is no context fallback. Unknown models get no vision and
     zero cost. For an ``openai/`` route, add both ``openai/<model>`` and
     ``<model>``. ``model_info`` is the shorthand for the run's model."""
 
     llm_call_kwargs: dict[str, Any] = Field(default_factory=dict)
     """Extra arguments for every model request (for example ``max_tokens``,
     ``timeout`` or ``extra_body``). They override all other request settings."""
-
-    # Options below follow Harbor's Terminus 2 names. Unset, each one keeps
-    # the default behavior.
 
     max_turns: int | None = Field(default=None, ge=1)
     """Maximum number of loop iterations, including retries. Reaching it ends
@@ -103,8 +101,9 @@ class ProximusConfig(AgentOptions):
     with ``reasoning_effort``."""
 
     model_info: dict[str, Any] | None = None
-    """LiteLLM model info for the run's model (context limit, vision, prices),
-    for models LiteLLM does not know."""
+    """LiteLLM model info for the run's model (context limit, vision, prices).
+    Set ``max_input_tokens`` to a positive integer if the registry has no valid
+    input limit. This is the only field used for the context limit."""
 
     @field_validator("prompt_template_path")
     @classmethod
