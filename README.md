@@ -10,7 +10,7 @@ Status: alpha (`0.1.0a1`), for Harbor `0.23.0`.
 ## Install and run
 
 ```sh
-uv pip install /path/to/harbor_proximus-0.1.0a1-py3-none-any.whl   # next to Harbor
+uv pip install "harbor-proximus @ git+https://github.com/Proximal-Labs/proximus"   # next to Harbor
 harbor run ... --agent harbor_proximus:Proximus --model anthropic/claude-opus-5 \
   --ak time_budget_sec=7200
 ```
@@ -106,6 +106,22 @@ Later layers win: defaults, `[agent.proximus]`, the run's model table, overrides
 `time_budget_sec` defaults to `[agent].timeout_sec`, relative template paths are
 task-relative, and `workspace_git_excludes` defaults to the task's `/app` artifact
 excludes. Invalid options raise `ValueError` before any sandbox starts.
+
+## Run on FrontierSWE v2
+
+[px-eval](https://github.com/Proximal-Labs/px-eval) is a thin runner for
+FrontierSWE v2 that supports Proximus. It reads each task's `[agent.proximus]` table,
+sets the hard timeout from `hard_timeout_sec`, and grades the runs later in clean
+verifier sandboxes:
+
+```sh
+uv run python examples/frontier_swe_v2/rollout.py /path/to/frontier-swe-v2/tasks \
+  --environment environment.yaml --agent proximus --model anthropic/claude-opus-5 \
+  --ak time_budget_sec=7200 --ae 'ANTHROPIC_API_KEY=${MY_KEY}'
+```
+
+See its [FrontierSWE v2 guide](https://github.com/Proximal-Labs/px-eval/blob/main/examples/frontier_swe_v2/README.md#run-with-proximus)
+for setup, every option and grading.
 
 ## Limits
 
