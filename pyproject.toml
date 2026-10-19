@@ -23,7 +23,7 @@ build-backend = "hatchling.build"
 packages = ["src/harbor_proximus"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/scripts", "/examples", "/README.md", "/AGENTS.md", "/pyproject.toml", "/LICENSE", "/NOTICE", "/uv.lock"]
+include = ["/src", "/tests", "/scripts", "/examples", "/README.md", "/pyproject.toml", "/LICENSE", "/NOTICE", "/uv.lock"]
 
 [dependency-groups]
 dev = [
