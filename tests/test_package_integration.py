@@ -25,7 +25,7 @@ from tests.test_proximus_loop import FakeCompletion, FakeEnv, finish_responses
     ],
 )
 async def test_factory_run_and_artifacts(tmp_path, monkeypatch, selector):
-    assert importlib.metadata.version("harbor") == "0.23.0"
+    assert importlib.metadata.version("harbor") == "0.24.0"
     fake = FakeCompletion(finish_responses())
     monkeypatch.setattr(litellm, "acompletion", fake)
     config = AgentConfig(

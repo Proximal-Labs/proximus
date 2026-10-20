@@ -1630,6 +1630,7 @@ async def test_chat_reasoning_content_round_trip(tmp_path, monkeypatch, model_na
         logs_dir=tmp_path / "logs",
         model_name=model_name,
         api_key_env=None,
+        model_info={"max_input_tokens": 128000},
     )
     await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
 

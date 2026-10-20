@@ -5,7 +5,7 @@ for [Harbor](https://pypi.org/project/harbor/). It runs a LiteLLM tool loop on t
 orchestrator host and acts in the sandbox only through Harbor's environment
 interface, so it works with any Harbor environment (Docker, Modal, ...).
 
-Status: alpha (`0.1.0a1`), for Harbor `0.23.0`.
+Status: alpha (`0.1.0a1`), for Harbor `0.24.0`.
 
 ## Install and run
 
@@ -125,7 +125,7 @@ for setup, every option and grading.
 
 ## Limits
 
-- Requires Harbor `0.23.0` and Python 3.12+; tested on Python 3.12–3.14 with
+- Requires Harbor `0.24.0` and Python 3.12+; tested on Python 3.12 with
   LiteLLM 1.97.0 and 1.105.1.
 - Installs a small process-wide LiteLLM shim for reasoning-only Responses turns
   at LLM construction; Harbor itself is not patched.
