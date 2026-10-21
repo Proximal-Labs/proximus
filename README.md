@@ -32,7 +32,30 @@ harbor run ... --agent harbor_proximus:Proximus --model anthropic/claude-opus-5 
   adding a second clock.
 - **Context:** near the context limit the conversation is compacted into a handoff
   summary; the model's notes in `/tmp/proximus/PROGRESS.md` survive it.
-- **Sandbox needs:** `git` and `bash`.
+- **Sandbox needs:** `bash`, and `git` in the default submission mode.
+
+## Git-free completion
+
+Set `submission_mode: "none"` for tasks whose instructions define a file deliverable:
+
+```yaml
+kwargs:
+  submission_mode: "none"
+  time_budget_sec: 1200
+```
+
+This mode exposes `done` instead of `submit` and `list_submissions`.
+One `done()` call ends the run. It does not inspect, validate, or change the deliverable.
+Proximus does not initialize Git, record a submission, or restore files, including on timeout or error.
+The workspace stays as the agent left it; Harbor collects the task's configured artifacts.
+Git-specific options have no effect in this mode.
+`hard_timeout_sec` adds only cleanup time, not Git submission or restore time.
+Trace metadata records `submission_mode` and `end_reason`; `submitted_commit` is null.
+
+The default `submission_mode: "git"` keeps the existing behavior.
+A subclass can still add tools through `build_tools()`.
+Any tool that returns `ToolResult(..., ends_run=True)` ends the loop.
+Plain text such as "done" does not end it.
 
 ## Models and credentials
 

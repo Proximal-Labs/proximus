@@ -41,6 +41,12 @@ SUBMIT_CONTINUE_OR_CONFIRM = (
 )
 
 SUBMIT_CONFIRMED = "Final submission confirmed. Ending the session."
+DONE_GUIDANCE = "- Follow the user's instructions. Call `done` when you are finished."
+DONE_MESSAGE = "Done. Ending the session."
+HANDOFF_FOOTER_NO_GIT = (
+    f"Before acting: read {PROGRESS_FILE} and inspect the current files. "
+    "Do not redo completed work. Continue the work."
+)
 
 SUBMIT_FALLBACK = (
     "The final workspace state at the end of the run will be used as your "
@@ -111,13 +117,25 @@ EMPTY_RESPONSE_MESSAGE = (
 )
 
 
-def system_prompt(task_provides_timer: bool = False) -> str:
+def empty_response_message(submission_mode: str = "git") -> str:
+    if submission_mode == "none":
+        return (
+            "Your previous response was empty. Reply with a tool call, or a short "
+            "note on what you are doing next. If you are finished, call `done`."
+        )
+    return EMPTY_RESPONSE_MESSAGE
+
+
+def system_prompt(
+    task_provides_timer: bool = False, submission_mode: str = "git"
+) -> str:
     """Render the system template with submit, timer, and durable-notes
     guidance."""
     template = utils.read_template("system.md")
     timer_line = TASK_TIMER_GUIDANCE if task_provides_timer else DEADLINE_GUIDANCE
+    completion = DONE_GUIDANCE if submission_mode == "none" else SUBMIT_GUIDANCE
     return (
-        template.replace("{{SUBMIT_GUIDANCE}}", SUBMIT_GUIDANCE)
+        template.replace("{{SUBMIT_GUIDANCE}}", completion)
         .replace("{{TIMER_GUIDANCE}}", timer_line)
         .replace("{{ARTIFACT_GUIDANCE}}", "")
         .replace("{{PROGRESS_FILE}}", str(PROGRESS_FILE))
@@ -170,6 +188,7 @@ def handoff_message(
     progress: str | None,
     elapsed: float,
     budget: float | None,
+    submission_mode: str = "git",
 ) -> str:
     """The compaction boundary message: header, original instruction, model
     summary, durable notes, remaining budget, footer."""
@@ -195,7 +214,7 @@ def handoff_message(
             f"{fmt_duration(budget)} remain "
             f"({round(100 * remaining / budget)}% left)."
         )
-    parts.append(HANDOFF_FOOTER)
+    parts.append(HANDOFF_FOOTER_NO_GIT if submission_mode == "none" else HANDOFF_FOOTER)
     return "\n\n".join(parts)
 
 

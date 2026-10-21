@@ -71,6 +71,7 @@ def make_agent(kwargs: dict[str, Any], logs_dir: Path):
 # entry here fails test_values_cover_every_field.
 FIELD_VALUES: dict[str, Any] = {
     "time_budget_sec": 1234.5,
+    "submission_mode": "none",
     "submission_timeout_sec": 42,
     "auto_submit_on_exit": False,
     "restore_on_exit": False,

@@ -90,7 +90,7 @@ class ToolResult:
     # (media_type, base64_data) — attached to the conversation as an image
     # content block by the agent loop (kept out of the ATIF trajectory).
     image: images.Attachment | None = None
-    # Set only by a confirmed final submission.
+    # Any completion tool can end the loop; no tool name is required.
     ends_run: bool = False
 
 
@@ -123,6 +123,8 @@ LIST_SUBMISSIONS_DESCRIPTION = (
     "List your recorded submissions (when, id, description) and "
     "which one is currently kept as your result."
 )
+
+DONE_DESCRIPTION = "End the session when you have finished the user's instructions."
 
 SUBMIT_DESCRIPTION = (
     "Submit the current workspace as your result. A commit is "

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from harbor.agents.options import AgentOptions
 from harbor.utils.templating import render_prompt_template
@@ -18,6 +18,12 @@ class ProximusConfig(AgentOptions):
     """Total time budget in seconds. The run stops when it is used up, whatever
     any task timer says. Set Harbor's hard agent timeout higher (see
     ``hard_timeout_sec``) so the exit submit and restore can finish."""
+
+    submission_mode: Literal["git", "none"] = "git"
+    """With ``git``, record and restore workspace submissions. With ``none``,
+    expose ``done`` instead of submission tools and leave workspace files
+    unchanged on exit. No repository is initialized; Git-specific options
+    have no effect. The task defines its own deliverables."""
 
     submission_timeout_sec: int = 600
     """Seconds allowed for one submission's git work in the sandbox. Large
@@ -84,7 +90,7 @@ class ProximusConfig(AgentOptions):
 
     disallowed_tools: list[str] = Field(default_factory=list)
     """Tools to remove: ``list_submissions`` or ``view_image``. ``bash`` and
-    ``submit`` are always available."""
+    the mode's completion tool (``submit`` or ``done``) cannot be removed."""
 
     prompt_template_path: str | None = None
     """Jinja2 template around the task instruction. It must contain

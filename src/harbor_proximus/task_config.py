@@ -33,7 +33,7 @@ from harbor_proximus.submissions import (
     RESTORE_TIMEOUT_SEC,
 )
 
-# Slack above the exit auto-submit and restore limits.
+# Cleanup slack, also used when there is no Git finalization.
 FINALIZE_MARGIN_SEC = 300
 
 TABLE = "proximus"
@@ -123,10 +123,12 @@ def task_agent_kwargs(
 def hard_timeout_sec(kwargs: dict[str, Any]) -> float | None:
     """Harbor's hard agent timeout (``AgentConfig.override_timeout_sec``) for
     these kwargs: the work budget plus room for the exit auto-submit and
-    restore, so Harbor's kill never cuts finalization short. None without a
-    budget."""
+    restore, so Harbor's kill never cuts finalization short. Git-free mode
+    needs only the cleanup margin. None without a budget."""
     budget = kwargs.get("time_budget_sec")
     if budget is None:
         return None
+    if kwargs.get("submission_mode", "git") == "none":
+        return float(budget) + FINALIZE_MARGIN_SEC
     submission = kwargs.get("submission_timeout_sec", DEFAULT_SUBMISSION_TIMEOUT_SEC)
     return float(budget) + float(submission) + RESTORE_TIMEOUT_SEC + FINALIZE_MARGIN_SEC

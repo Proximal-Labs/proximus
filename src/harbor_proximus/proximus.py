@@ -46,6 +46,7 @@ class RunState:
     # Turn of the submit awaiting confirmation; see _submit.
     submit_armed_turn: int | None = None
     ended_by_submit: bool = False
+    end_reason: str | None = None
     env_lost: bool = False
     consecutive_empty_turns: int = 0
     stalled: bool = False
@@ -179,18 +180,25 @@ class Proximus(BaseAgent):
             default_workdir=workdir,
             remaining_sec=self._remaining_budget_sec,
         )
-        await self._init_submissions(environment, workdir)
+        if self.config.submission_mode == "git":
+            await self._init_submissions(environment, workdir)
         await self._arm_timer(environment)
         self._seed_conversation(instruction, workdir, environment)
 
         try:
             await self._agent_loop()
+        except BaseException:
+            if self._run.end_reason is None:
+                self._run.end_reason = "error"
+            raise
         finally:
             try:
                 should_finalize = (
                     not self.config.finalize_only_on_submit or self._run.ended_by_submit
                 )
-                if self._run.env_lost:
+                if self.config.submission_mode == "none":
+                    pass
+                elif self._run.env_lost:
                     self.logger.info("End-of-run restore skipped: the sandbox is gone.")
                 elif not should_finalize:
                     self.logger.info(
@@ -216,10 +224,12 @@ class Proximus(BaseAgent):
             budget = self.config.time_budget_sec
             if budget and self._elapsed() >= budget:
                 self.logger.debug("Time budget exhausted; ending run.")
+                self._run.end_reason = "time_budget"
                 return
             if self.config.max_turns and turn > self.config.max_turns:
                 self.logger.debug("Turn limit reached; ending run.")
                 self._run.n_turns = turn - 1
+                self._run.end_reason = "max_turns"
                 return
 
             tokens = self._run.last_context_tokens
@@ -319,12 +329,13 @@ class Proximus(BaseAgent):
                         "turns; ending run."
                     )
                     self._run.stalled = True
+                    self._run.end_reason = "stalled"
                     return
 
                 if self._run.submit_armed_turn is not None:
                     closer = prompts.CONTINUE_OR_CONFIRM_MESSAGE
                 elif self._run.consecutive_empty_turns > 0:
-                    closer = prompts.EMPTY_RESPONSE_MESSAGE
+                    closer = prompts.empty_response_message(self.config.submission_mode)
                 else:
                     closer = prompts.CONTINUE_MESSAGE
                 self._run.messages.append({"role": "user", "content": closer})
@@ -344,8 +355,7 @@ class Proximus(BaseAgent):
         return self._run.consecutive_empty_turns >= EMPTY_TURN_STALL_LIMIT
 
     async def _execute_tool_calls(self, parsed: llm.ParsedResponse) -> bool:
-        """Run the turn's tool calls; True when a confirmed final submission
-        (or a dead sandbox) ends the run"""
+        """Run the turn's tool calls; True when a tool or a dead sandbox ends the run."""
         end_run = False
         env_gone: tools.EnvironmentGoneError | None = None
         observation_results: list[trajectories.ObservationResult] = []
@@ -366,10 +376,9 @@ class Proximus(BaseAgent):
                     is_error=True,
                 )
             elif end_run:
-                # Calls after a confirming submit must not execute, but each
-                # still needs a result to keep the conversation valid.
+                # Complete the message batch without executing more actions.
                 result = tools.ToolResult(
-                    "Not executed: an earlier submit in this turn ended the run.",
+                    "Not executed: an earlier tool call in this turn ended the run.",
                     is_error=True,
                 )
             elif tool is None:
@@ -397,8 +406,9 @@ class Proximus(BaseAgent):
                     "other tool calls in between.)"
                 )
 
-            if call.name == "submit" and result.ends_run:
-                self._run.ended_by_submit = True
+            if result.ends_run:
+                self._run.end_reason = call.name
+                self._run.ended_by_submit = call.name == "submit"
             end_run = end_run or result.ends_run
             if result.image is not None:
                 # Deferred: an image message must not split the contiguous
@@ -447,6 +457,7 @@ class Proximus(BaseAgent):
                 env_gone,
             )
             self._run.env_lost = True
+            self._run.end_reason = "environment_lost"
             end_run = True
 
         if pending_images and not end_run:
@@ -470,7 +481,9 @@ class Proximus(BaseAgent):
     # the way Harbor agents are customized.
 
     def system_prompt(self) -> str:
-        return prompts.system_prompt(self.config.task_provides_timer)
+        return prompts.system_prompt(
+            self.config.task_provides_timer, self.config.submission_mode
+        )
 
     def initial_message(
         self, instruction: str, workdir: str, environment: BaseEnvironment
@@ -510,6 +523,15 @@ class Proximus(BaseAgent):
                 "submit", tools.SUBMIT_DESCRIPTION, tools.SubmitArgs, self._submit
             ),
         ]
+        if self.config.submission_mode == "none":
+            surface = [
+                tool
+                for tool in surface
+                if tool.name not in {"submit", "list_submissions"}
+            ]
+            surface.append(
+                tools.Tool("done", tools.DONE_DESCRIPTION, tools.NoArgs, self._done)
+            )
         if not self._llm.supports_vision():
             surface = [tool for tool in surface if tool.name != "view_image"]
         return {tool.name: tool for tool in surface}
@@ -523,11 +545,16 @@ class Proximus(BaseAgent):
         removed = set(self.config.disallowed_tools)
         if removed & {"bash", "submit"}:
             raise ValueError("disallowed_tools cannot remove bash or submit")
-        # view_image is dropped for non-vision models, so naming it is fine.
-        unknown = removed - set(by_name) - {"view_image"}
+        if "done" in removed:
+            raise ValueError("disallowed_tools cannot remove done")
+        # Known optional tools can already be absent in this mode or model.
+        unknown = removed - set(by_name) - {"view_image", "list_submissions"}
         if unknown:
             raise ValueError(f"disallowed_tools names unknown tools: {sorted(unknown)}")
         return {name: tool for name, tool in by_name.items() if name not in removed}
+
+    async def _done(self, _: tools.NoArgs) -> tools.ToolResult:
+        return tools.ToolResult(prompts.DONE_MESSAGE, ends_run=True)
 
     async def _bash(self, args: tools.BashArgs) -> tools.ToolResult:
         return await self._executor.bash(args)
@@ -619,6 +646,7 @@ class Proximus(BaseAgent):
             progress,
             self._elapsed(),
             self.config.time_budget_sec,
+            self.config.submission_mode,
         )
 
         messages = self._run.messages
@@ -820,6 +848,8 @@ class Proximus(BaseAgent):
             # The commit grading checks out; None = score the workspace as-is.
             "submitted_commit": self._submissions.winner_hash() if has_store else None,
             "ended_by_submit": run.ended_by_submit,
+            "end_reason": run.end_reason,
+            "submission_mode": self.config.submission_mode,
             "env_lost": run.env_lost,  # cut short by a dead sandbox
             "stalled": run.stalled,  # ended by the empty-turn breaker
             "fallback_attempted_turns": run.fallback_attempted_turns,
