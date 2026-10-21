@@ -185,14 +185,13 @@ async def test_saved_output_can_be_read_through_later_bash_calls(tmp_path):
             path.unlink(missing_ok=True)
 
 
-def test_description_explains_sequential_calls_background_work_and_output():
+def test_description_explains_sequential_calls_background_work_and_timeout():
     for phrase in (
-        "sequentially in the order you emit them",
-        "multiple calls in the same response",
-        "do not run in parallel",
+        "sequentially in response order",
+        "calls in the same response",
+        "separate log and PID files for each job",
         "nohup ./run.sh > /tmp/run.log 2>&1 & echo $! > /tmp/run.pid",
         "Set timeout_sec",
         "does not guarantee the process was killed",
-        "saved in full",
     ):
         assert phrase in BASH_DESCRIPTION
