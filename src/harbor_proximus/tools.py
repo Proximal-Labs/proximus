@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import time
@@ -5,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -99,16 +101,24 @@ BASH_DESCRIPTION = (
     "output. Each call runs in a FRESH shell from the task "
     "working directory: environment variables and shell state "
     "do not persist between calls, so prefer absolute paths. "
-    "Long output is truncated in the middle. Default timeout "
-    f"{DEFAULT_TIMEOUT_SEC}s, max "
-    f"{MAX_TIMEOUT_SEC}s. Anything that may run longer "
-    "(builds, training runs, benchmarks, servers, parameter "
-    "sweeps) must be launched in the background rather than "
-    "waited on in the foreground: redirect output to a log "
-    "file and append ` &` (e.g. `nohup ./run.sh > /tmp/run.log "
-    "2>&1 &`), checkpoint best-so-far results to a file, then "
-    "poll the log with later calls. A foreground command that "
-    "hits the timeout is killed and its work lost."
+    "Tool calls run sequentially in the order you emit them, including "
+    "multiple calls in the same response. The next call does not start until "
+    "the current call returns; multiple bash calls do not run in parallel. "
+    "For parallel work, start processes in the background with `&`, redirect "
+    "each process's stdout/stderr to its own log file, save its PID, and check "
+    "progress and results with later calls (e.g. `nohup ./run.sh > /tmp/run.log "
+    "2>&1 & echo $! > /tmp/run.pid`). Background work can continue while later "
+    "tool calls run; you must monitor it yourself. "
+    f"The tool waits up to {DEFAULT_TIMEOUT_SEC // 60} minutes by default. "
+    f"Set timeout_sec to request a longer wait, up to {MAX_TIMEOUT_SEC} seconds "
+    f"({MAX_TIMEOUT_SEC // 60} minutes), also bounded by the remaining run time. "
+    "Processes that may exceed the selected timeout must run in the background. "
+    "A timeout does not guarantee the process was killed; check before retrying. "
+    f"Output previews keep the beginning and end of {OUTPUT_LIMIT_CHARS:,} "
+    "characters of stdout/stderr, with the middle removed. Large output is "
+    "also saved in full to separate stdout and stderr files in the sandbox's "
+    "/tmp directory; the result gives their paths. Read ranges or search those "
+    "files with later bash calls to recover omitted output."
 )
 
 VIEW_IMAGE_DESCRIPTION = (
@@ -124,7 +134,11 @@ LIST_SUBMISSIONS_DESCRIPTION = (
     "which one is currently kept as your result."
 )
 
-DONE_DESCRIPTION = "End the session when you have finished the user's instructions."
+DONE_DESCRIPTION = (
+    "End the session. Before calling done, check the remaining time and budget. "
+    "If resources remain and you think you can make further progress on the "
+    "task, continue working instead."
+)
 
 SUBMIT_DESCRIPTION = (
     "Submit the current workspace as your result. A commit is "
@@ -143,7 +157,7 @@ class BashArgs(BaseModel):
         strict=True,
         ge=1,
         description=(
-            "Seconds before the command is killed (default "
+            "Seconds to wait for the command (default "
             f"{DEFAULT_TIMEOUT_SEC}, max {MAX_TIMEOUT_SEC})."
         ),
     )
@@ -255,15 +269,19 @@ def truncate_middle(text: str, limit_chars: int) -> str:
     )
 
 
-def format_exec_output(stdout: str | None, stderr: str | None) -> str:
-    """Join stdout + stderr into one model-readable block, truncated in
-    the middle."""
+def _join_exec_output(stdout: str | None, stderr: str | None) -> str:
+    """Join the captured text without truncation."""
     parts = []
     if stdout:
         parts.append(stdout.rstrip("\n"))
     if stderr:
         parts.append(f"[stderr]\n{stderr.rstrip()}")
-    body = "\n".join(parts).strip()
+    return "\n".join(parts).strip()
+
+
+def format_exec_output(stdout: str | None, stderr: str | None) -> str:
+    """Join stdout + stderr into one model-readable block, truncated in the middle."""
+    body = _join_exec_output(stdout, stderr)
     return truncate_middle(body, OUTPUT_LIMIT_CHARS) if body else "(no output)"
 
 
@@ -319,22 +337,65 @@ class ToolExecutor:
             raise_if_environment_gone(e)
             return ToolResult(
                 f"Command timed out after {timeout}s (timeout_sec={timeout}) "
-                f"and was killed. {self._timeout_guidance(timeout)}",
+                f"without returning captured output. {self._timeout_guidance(timeout)}",
                 is_error=True,
             )
-        body = format_exec_output(result.stdout, result.stderr)
         elapsed = time.monotonic() - started
+        body, save_failed = await self._bash_output(result.stdout, result.stderr)
         if self._looks_like_timeout(result.return_code, elapsed, timeout):
             return ToolResult(
                 f"Command timed out after ~{int(elapsed)}s "
-                f"(timeout_sec={timeout}) and was killed; output up to that "
+                f"(timeout_sec={timeout}); captured output up to that "
                 f"point:\n{body}\n{self._timeout_guidance(timeout)}",
                 is_error=True,
             )
         return ToolResult(
             f"exit code: {result.return_code}\n{body}",
-            is_error=result.return_code != 0,
+            is_error=result.return_code != 0 or save_failed,
         )
+
+    async def _bash_output(
+        self, stdout: str | None, stderr: str | None
+    ) -> tuple[str, bool]:
+        """Spill large captured output to agent-readable sandbox files.
+
+        Preserve each stream exactly, including trailing whitespace. This saves
+        what the environment returned; it cannot recover a transport's missing
+        or undecodable output. Small commands need no extra environment calls.
+        """
+        body = _join_exec_output(stdout, stderr)
+        preview = truncate_middle(body, OUTPUT_LIMIT_CHARS) if body else "(no output)"
+        if max(len(body), len(stdout or "") + len(stderr or "")) <= OUTPUT_LIMIT_CHARS:
+            return preview, False
+
+        prefix = f"/tmp/proximus-output-{uuid4().hex}"
+        notes = []
+        failed = False
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for stream, text in (("stdout", stdout), ("stderr", stderr)):
+                remote = f"{prefix}.{stream}"
+                try:
+                    local = Path(tmp_dir) / stream
+                    local.write_text(text or "", encoding="utf-8", newline="")
+                    # The host temp directory is private. The copied file must
+                    # be readable even if the environment uploads as root.
+                    local.chmod(0o644)
+                    await asyncio.wait_for(
+                        self._environment.upload_file(local, remote), timeout=30
+                    )
+                    notes.append(f"Full captured {stream}: {remote}")
+                except EnvironmentGoneError:
+                    raise
+                except Exception as e:
+                    raise_if_environment_gone(e)
+                    failed = True
+                    detail = truncate_middle(f"{type(e).__name__}: {e}", 500)
+                    notes.append(
+                        f"WARNING: could not save full {stream}: {detail}. "
+                        "Only the preview is available; the command already ran."
+                    )
+        notes.append("Read ranges or search the saved files with later bash calls.")
+        return "\n".join(notes) + "\n\n" + preview, failed
 
     async def view_image(self, args: ViewImageArgs) -> ToolResult:
         path = args.path
@@ -373,14 +434,15 @@ class ToolExecutor:
 
     @staticmethod
     def _timeout_guidance(timeout: int) -> str:
+        warning = "The process may still be running; check it before retrying. "
         if timeout >= MAX_TIMEOUT_SEC:
             # At the ceiling, "raise timeout_sec" is impossible advice.
-            return (
+            return warning + (
                 f"This is the maximum foreground timeout ({MAX_TIMEOUT_SEC}s). "
                 "Run this in the background instead: redirect to a log and "
                 "append ` &`, then poll the log with later commands."
             )
-        return (
+        return warning + (
             f"Raise timeout_sec (up to {MAX_TIMEOUT_SEC}s), or run it in "
             "the background (redirect to a log, append ` &`, poll the log)."
         )

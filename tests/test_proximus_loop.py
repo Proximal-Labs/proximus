@@ -855,30 +855,42 @@ def test_default_tool_surface_for_non_vision_models(tmp_path, monkeypatch):
     assert names == ["bash", "list_submissions", "submit"]
 
 
-def test_vision_models_get_view_image(tmp_path, monkeypatch):
+def test_vision_models_get_view_image_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     names = [s["function"]["name"] for s in agent._tool_schemas]
     assert names == ["bash", "view_image", "list_submissions", "submit"]
 
 
-def test_non_vision_models_lack_view_image(tmp_path, monkeypatch):
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: False)
+@pytest.mark.parametrize("vision", [False, True, None])
+def test_image_tool_is_opt_in_regardless_of_capability(tmp_path, monkeypatch, vision):
+    monkeypatch.setattr(litellm, "supports_vision", lambda model: vision)
     agent = make_agent(tmp_path)
-    names = [s["function"]["name"] for s in agent._tool_schemas]
-    assert "view_image" not in names
+    assert "view_image" not in agent._tools
 
 
-def test_vision_probe_failure_degrades_to_no_view_image(tmp_path, monkeypatch):
-    # A registry hiccup must not kill agent construction; the model is
-    # treated as blind and the run proceeds on bash+submit.
+@pytest.mark.parametrize("vision", [False, None])
+def test_enabled_image_tool_rejects_non_vision_or_unknown_model(
+    tmp_path, monkeypatch, vision
+):
+    monkeypatch.setattr(litellm, "supports_vision", lambda model: vision)
+    with pytest.raises(ValueError, match="requires known vision support.*gpt-test"):
+        make_agent(tmp_path, enable_view_image=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_vision_probe_failure_is_fatal_only_when_requested(
+    tmp_path, monkeypatch, enabled
+):
     def supports_vision(model):
         raise ValueError(f"model not in registry: {model}")
 
     monkeypatch.setattr(litellm, "supports_vision", supports_vision)
-    agent = make_agent(tmp_path)
-    names = [s["function"]["name"] for s in agent._tool_schemas]
-    assert names == ["bash", "list_submissions", "submit"]
+    if enabled:
+        with pytest.raises(ValueError, match="requires known vision support"):
+            make_agent(tmp_path, enable_view_image=True)
+    else:
+        assert "view_image" not in make_agent(tmp_path)._tools
 
 
 async def test_view_image_attaches_user_image_message(tmp_path, monkeypatch):
@@ -906,7 +918,7 @@ async def test_view_image_attaches_user_image_message(tmp_path, monkeypatch):
 
             Path(target_path).write_bytes(png)
 
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Check the plot", ImageEnv(), AgentContext())  # type: ignore[arg-type]
 
     messages = read_messages(agent)
@@ -960,7 +972,7 @@ async def test_image_does_not_split_tool_result_block(tmp_path, monkeypatch):
 
             Path(target_path).write_bytes(png)
 
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Task", ImageEnv(), AgentContext())  # type: ignore[arg-type]
 
     messages = read_messages(agent)
@@ -1014,7 +1026,7 @@ async def test_image_batch_requests_and_archive_numbering(
         async def download_file(self, source_path, target_path):
             Path(target_path).write_bytes(png)
 
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     write_bytes = Path.write_bytes
 
     def save_bytes(path, data):
@@ -2082,7 +2094,7 @@ async def test_viewed_image_saved_to_disk_and_referenced_in_step(tmp_path, monke
 
             Path(target_path).write_bytes(png)
 
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Check the plot", ImageEnv(), AgentContext())  # type: ignore[arg-type]
 
     saved = list((agent.logs_dir / "images").glob("turn*.png"))
@@ -2146,7 +2158,7 @@ async def test_request_too_large_evicts_newest_image_and_retries(tmp_path, monke
             Path(target_path).write_bytes(png)
 
     env = ImageEnv()
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
 
     # The failing call was not retried; the turn was re-run after eviction.
@@ -2216,7 +2228,7 @@ async def test_invalid_image_is_removed_and_error_returned_to_model(
             Path(target_path).write_bytes(png)
 
     env = ImageEnv()
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
 
     assert env.exec_calls == ["python resize_and_pad.py /app/tiny.png"]
@@ -2291,7 +2303,7 @@ async def test_image_count_limit_compacts_instead_of_repeated_eviction(
             Path(target_path).write_bytes(png)
 
     env = ImageEnv()
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, enable_view_image=True)
     await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
 
     assert env.exec_calls == ["echo recovered"]

@@ -55,6 +55,10 @@ def test_mode_validation_and_tools(tmp_path):
     agent = make_agent(tmp_path, submission_mode="none")
     assert set(agent._tools) == {"bash", "done"}
     assert "call `done`" in agent._system_prompt.lower()
+    assert "check the remaining time and budget" in agent._system_prompt
+    assert "continue working" in agent._system_prompt
+    assert "Call `done` only after" in agent._system_prompt
+    assert "continue working instead" in agent._tools["done"].description
     assert "grading" not in agent._system_prompt.lower()
     assert "submit" not in agent._system_prompt.lower()
     with pytest.raises(ValueError, match="cannot remove done"):

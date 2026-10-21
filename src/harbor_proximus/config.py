@@ -88,6 +88,12 @@ class ProximusConfig(AgentOptions):
     compaction_threshold: float = Field(default=0.85, gt=0, le=1)
     """Fraction of the context limit at which the conversation is summarized."""
 
+    enable_view_image: bool = False
+    """Opt in to ``view_image``. Construction fails unless the model has known
+    vision support. For an unregistered vision model, set its actual capability
+    with ``model_info={\"supports_vision\": True, ...}``. Cannot be combined with
+    ``view_image`` in ``disallowed_tools``."""
+
     disallowed_tools: list[str] = Field(default_factory=list)
     """Tools to remove: ``list_submissions`` or ``view_image``. ``bash`` and
     the mode's completion tool (``submit`` or ``done``) cannot be removed."""
@@ -120,6 +126,15 @@ class ProximusConfig(AgentOptions):
             # Raises unless the template uses {{ instruction }}.
             render_prompt_template(Path(value), "instruction")
         return value
+
+    @model_validator(mode="after")
+    def _consistent_image_options(self) -> Self:
+        if self.enable_view_image and "view_image" in self.disallowed_tools:
+            raise ValueError(
+                "enable_view_image=True conflicts with disallowed_tools containing "
+                "view_image; disable the option or remove the exclusion"
+            )
+        return self
 
     @model_validator(mode="after")
     def _one_thinking_control(self) -> Self:

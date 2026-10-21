@@ -87,13 +87,14 @@ FIELD_VALUES: dict[str, Any] = {
     "llm_call_kwargs": {"timeout": 5, "extra_body": {"a": 1}},
     "max_turns": 7,
     "enable_summarize": False,
+    "enable_view_image": True,
     "compaction_threshold": 0.5,
     "disallowed_tools": ["list_submissions"],
     "prompt_template_path": "prompt.j2",
     "temperature": 0.3,
     "api_base": "http://127.0.0.1:9/v1",
     "max_thinking_tokens": 2048,
-    "model_info": {"max_input_tokens": 77777, "supports_vision": False},
+    "model_info": {"max_input_tokens": 77777, "supports_vision": True},
 }
 
 
@@ -110,6 +111,8 @@ def test_every_field_round_trips_through_task_toml_and_factory(
     tmp_path, field, monkeypatch
 ):
     value = FIELD_VALUES[field]
+    if field == "enable_view_image":
+        monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     expected = value
@@ -134,6 +137,8 @@ def test_every_field_round_trips_through_task_toml_and_factory(
         assert agent._context_limit == 77777
     if field == "litellm_model_info":
         assert agent._context_limit == 50000
+        assert "view_image" not in agent._tools
+    if field == "enable_view_image":
         assert "view_image" in agent._tools
     if field == "api_key_env":
         assert agent._llm._api_key == "roundtrip-key"
@@ -170,6 +175,13 @@ def test_all_fields_together(tmp_path, monkeypatch):
             '[agent.proximus]\ndisallowed_tools = "bash"\n', id="wrong-type-list"
         ),
         pytest.param("[agent.proximus]\nmax_turns = 0\n", id="max-turns-below-1"),
+        pytest.param(
+            '[agent.proximus]\nenable_view_image = true\ndisallowed_tools = ["view_image"]\n',
+            id="contradictory-image-options",
+        ),
+        pytest.param(
+            '[agent.proximus]\nenable_view_image = "nah"\n', id="bad-image-option"
+        ),
         pytest.param(
             "[agent.proximus]\ncompaction_threshold = 1.5\n", id="threshold-gt-1"
         ),

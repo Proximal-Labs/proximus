@@ -41,7 +41,12 @@ SUBMIT_CONTINUE_OR_CONFIRM = (
 )
 
 SUBMIT_CONFIRMED = "Final submission confirmed. Ending the session."
-DONE_GUIDANCE = "- Follow the user's instructions. Call `done` when you are finished."
+DONE_GUIDANCE = (
+    "- Follow the user's instructions. Before calling `done`, check the remaining "
+    "time and budget. If you have more time and budget left and think you can "
+    "make further progress on the task, continue working. Call `done` only after "
+    "you feel you cannot progress further with the resources left."
+)
 DONE_MESSAGE = "Done. Ending the session."
 HANDOFF_FOOTER_NO_GIT = (
     f"Before acting: read {PROGRESS_FILE} and inspect the current files. "

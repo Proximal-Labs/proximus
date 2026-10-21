@@ -103,6 +103,7 @@ def test_user_registry_controls_context_and_vision(tmp_path):
         model_name=model,
         litellm_model_info={model: entry, model.split("/", 1)[1]: entry},
         reasoning_effort="high",
+        enable_view_image=True,
     )
     assert agent._context_limit == 123456
     assert "view_image" in agent._tools

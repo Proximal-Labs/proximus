@@ -20,7 +20,8 @@ harbor run ... --agent harbor_proximus:Proximus --model anthropic/claude-opus-5 
 
 ## How it works
 
-- **Tools:** `bash`, `submit`, `list_submissions`, and `view_image` for vision models.
+- **Tools:** `bash`, `submit`, and `list_submissions`. `view_image` requires an
+  explicit opt-in and a vision-capable model.
 - **Submissions** are Git commits in the workspace. The first `submit` records a
   commit; a `submit` on a later turn confirms it and ends the run, and any other
   tool call in between cancels the confirmation. The latest submission wins.
@@ -46,6 +47,9 @@ kwargs:
 
 This mode exposes `done` instead of `submit` and `list_submissions`.
 One `done()` call ends the run. It does not inspect, validate, or change the deliverable.
+The prompt asks the agent to check its remaining time and budget first.
+If resources and further progress remain, the agent must continue working.
+This is prompt guidance, not a minimum runtime or a second confirmation call.
 Proximus does not initialize Git, record a submission, or restore files, including on timeout or error.
 The workspace stays as the agent left it; Harbor collects the task's configured artifacts.
 Git-specific options have no effect in this mode.
@@ -56,6 +60,51 @@ The default `submission_mode: "git"` keeps the existing behavior.
 A subclass can still add tools through `build_tools()`.
 Any tool that returns `ToolResult(..., ends_run=True)` ends the loop.
 Plain text such as "done" does not end it.
+
+## Bash execution and output
+
+Tool calls run sequentially, in the order returned by the model.
+This also applies to multiple calls in one response; they do not run in parallel.
+Each bash call uses a fresh shell in the task's working directory.
+For parallel work, launch background processes with separate logs and saved PIDs:
+
+```sh
+nohup ./run.sh > /tmp/run.log 2>&1 & echo $! > /tmp/run.pid
+```
+
+Check the logs, processes, and results with later calls.
+`timeout_sec` defaults to 600 seconds and accepts at most 1,800 seconds.
+The remaining work budget can reduce that wait.
+Run work that may exceed its selected timeout in the background.
+Timeout cleanup depends on the environment; do not assume that it killed the process.
+
+Large output previews keep 30,000 characters from the beginning and end, plus a truncation marker.
+The complete captured stdout and stderr are also saved separately in the sandbox:
+`/tmp/proximus-output-<unique-id>.stdout` and `.stderr`.
+The tool result gives both paths. Use later bash calls to search or read ranges.
+The files preserve the original captured text, including trailing whitespace and empty streams.
+Small outputs need no file transfer. Failed saves produce an explicit tool error and keep the preview.
+These files last for the sandbox's lifetime unless the agent removes them.
+This cannot recover output that the environment never returns, including failed text decoding.
+Redirect long-running commands to files from the start to retain output across such failures.
+
+## Image opt-in
+
+`enable_view_image` defaults to `false`, even for vision-capable models.
+Set it to `true` in agent kwargs or `[agent.proximus]` to expose `view_image`:
+
+```yaml
+kwargs:
+  enable_view_image: true
+```
+
+Construction fails if the enabled tool's model lacks known vision support.
+An unknown capability or a failed capability lookup is an error, not a silent tool removal.
+For an unregistered vision model, provide its actual capability through `model_info.supports_vision`.
+Do not claim vision support for a text-only model.
+Enabling the tool while excluding it through `disallowed_tools` is also an error.
+Existing image-dependent configurations must add this explicit opt-in.
+Text-only runs do not require vision support.
 
 ## Models and credentials
 
@@ -80,8 +129,9 @@ agent options verbatim in job files.
 Options follow Harbor's Terminus 2 names where they exist: `max_turns`,
 `enable_summarize`, `temperature`, `api_base`, `max_thinking_tokens`,
 `model_info`, `llm_call_kwargs` and `prompt_template_path` (a Jinja template
-around `{{ instruction }}`). Proximus adds `compaction_threshold` (default 0.85)
-and `disallowed_tools` (`list_submissions`, `view_image`). Unset options keep the
+around `{{ instruction }}`). Proximus adds `compaction_threshold` (default 0.85),
+`enable_view_image` (default false), and `disallowed_tools`
+(`list_submissions`, `view_image`). Unset options keep the
 default behavior, and `llm_call_kwargs` wins over the other request settings.
 `max_thinking_tokens` and `reasoning_effort` are mutually exclusive, and
 `max_turns` counts every loop iteration, including recovery retries.

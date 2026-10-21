@@ -550,7 +550,10 @@ def test_tool_schema_shape():
     # The fixed timeout limits are rendered into the bash descriptions.
     bash = schemas["bash"]["function"]
     assert (
-        f"Default timeout {DEFAULT_TIMEOUT_SEC}s, max {MAX_TIMEOUT_SEC}s"
+        f"up to {DEFAULT_TIMEOUT_SEC // 60} minutes by default" in bash["description"]
+    )
+    assert (
+        f"up to {MAX_TIMEOUT_SEC} seconds ({MAX_TIMEOUT_SEC // 60} minutes)"
         in bash["description"]
     )
     assert (

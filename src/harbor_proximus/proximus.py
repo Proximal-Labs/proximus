@@ -532,8 +532,16 @@ class Proximus(BaseAgent):
             surface.append(
                 tools.Tool("done", tools.DONE_DESCRIPTION, tools.NoArgs, self._done)
             )
-        if not self._llm.supports_vision():
+        if not self.config.enable_view_image:
             surface = [tool for tool in surface if tool.name != "view_image"]
+        elif not self._llm.supports_vision():
+            raise ValueError(
+                f"enable_view_image=True requires known vision support, but "
+                f"{self.model_name!r} does not support vision or its capability is "
+                "unknown. Use a vision-capable model or disable enable_view_image. "
+                "For an unregistered vision model, set its actual capability in "
+                "model_info (supports_vision=True)."
+            )
         return {tool.name: tool for tool in surface}
 
     @property
