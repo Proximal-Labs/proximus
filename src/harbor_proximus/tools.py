@@ -368,12 +368,13 @@ class ToolExecutor:
         if max(len(body), len(stdout or "") + len(stderr or "")) <= OUTPUT_LIMIT_CHARS:
             return preview, False
 
-        prefix = f"/tmp/proximus-output-{uuid4().hex}"
         notes = []
         failed = False
         with tempfile.TemporaryDirectory() as tmp_dir:
             for stream, text in (("stdout", stdout), ("stderr", stderr)):
-                remote = f"{prefix}.{stream}"
+                # Independent names: the first upload must not reveal a future
+                # root-upload target in an agent-writable directory.
+                remote = f"/tmp/proximus-output-{uuid4().hex}.{stream}"
                 try:
                     local = Path(tmp_dir) / stream
                     local.write_text(text or "", encoding="utf-8", newline="")

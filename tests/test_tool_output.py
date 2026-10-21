@@ -44,6 +44,9 @@ async def test_full_streams_preserved_exactly(stdout, stderr):
     result = await make_executor(env).bash(BashArgs(command="produce output"))
     assert not result.is_error
     assert len(env.files) == 2
+    # Seeing stdout's name must not let a sandbox process preplant a symlink
+    # at the next upload's path when the backend writes files as root.
+    assert len({path.rsplit(".", 1)[0] for path in env.files}) == 2
     for stream, text in (("stdout", stdout), ("stderr", stderr)):
         path = next(p for p in env.files if p.endswith(f".{stream}"))
         assert path.startswith("/tmp/proximus-output-")
