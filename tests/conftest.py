@@ -1,41 +1,37 @@
 """Keep the compatibility suite offline and independent of local credentials."""
 
-import os
 import socket
 
 import pytest
 
-os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+from harbor_proximus import model_info
+
+TEST_MODELS = [
+    "openai/gpt-test",
+    "openai/test-model",
+    "openai/claude-custom",
+    "openai/Claude-custom",
+    "anthropic/claude-test",
+    "anthropic/claude-opus-test",
+    "anthropic/test-model",
+]
 
 
 @pytest.fixture(autouse=True)
 def fake_model_limits(monkeypatch):
     """Give test-only models explicit limits without changing production lookup."""
-    import copy
+    table = {
+        **model_info.builtin_table(),
+        **{name: {"max_input_tokens": 200_000} for name in TEST_MODELS},
+    }
+    monkeypatch.setattr(model_info, "builtin_table", lambda: table)
 
-    import litellm
 
-    monkeypatch.setattr(litellm, "model_cost", copy.deepcopy(litellm.model_cost))
-    models = [
-        "openai/gpt-test",
-        "openai/test-model",
-        "openai/claude-custom",
-        "openai/Claude-custom",
-        "anthropic/claude-test",
-        "anthropic/claude-opus-test",
-        "anthropic/test-model",
-        "bedrock/test-model",
-        "gemini/test-model",
-    ]
-    litellm.register_model(
-        {
-            model: {
-                "max_input_tokens": 200_000,
-                "litellm_provider": model.split("/", 1)[0],
-            }
-            for model in models
-        }
-    )
+@pytest.fixture(autouse=True)
+def fake_api_keys(monkeypatch):
+    """SDK clients are built with the agent; the network is blocked anyway."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
 
 @pytest.fixture(autouse=True)

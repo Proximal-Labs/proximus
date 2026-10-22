@@ -9,7 +9,6 @@ verifier and that capture see the submitted tree."""
 import json
 import logging
 
-import litellm
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
@@ -125,7 +124,7 @@ async def test_submit_records_pins_and_confirms(tmp_path, monkeypatch):
     fake = FakeCompletion(
         [git_submit_response(), git_submit_response(call_id="call_g2")]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = GitEnv()
@@ -179,7 +178,7 @@ async def test_explicit_commit_ref_is_submitted(tmp_path, monkeypatch):
     fake = FakeCompletion(
         [git_submit_response(commit="fix2"), git_submit_response(commit="fix2")]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()
@@ -209,7 +208,7 @@ async def test_confirm_with_a_new_commit_records_it(tmp_path, monkeypatch):
             git_submit_response(commit="fix2", call_id="call_g2"),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()
@@ -236,7 +235,7 @@ async def test_unknown_commit_fails_readably_and_keeps_prior_winner(
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()
@@ -267,7 +266,7 @@ async def test_failed_record_after_a_good_one_names_the_prior_winner(
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()
@@ -289,7 +288,7 @@ async def test_malformed_commit_argument_neither_arms_nor_confirms(
             git_submit_response(call_id="call_z"),  # confirms the pending one
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()
@@ -327,7 +326,7 @@ async def test_list_submissions_shows_store_rows_and_winner(tmp_path, monkeypatc
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = GitEnv()
@@ -389,7 +388,7 @@ async def test_restore_on_exit_false_keeps_kill_time_state(tmp_path, monkeypatch
     # restore command reaches the sandbox — the workspace capture carries the
     # kill-time workspace, and grading goes through the pinned refs.
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600, restore_on_exit=False)
     env = GitEnv()
@@ -430,7 +429,7 @@ async def test_confirm_with_dirty_tree_records_only_the_model_snapshot(
     fake = FakeCompletion(
         [git_submit_response(), git_submit_response(call_id="call_g2")]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = DirtyGitEnv()
@@ -486,7 +485,7 @@ async def test_run_end_without_submit_auto_pins_final_state(tmp_path, monkeypatc
         [bash_response("echo work")]
         + [empty_response() for _ in range(EMPTY_TURN_STALL_LIMIT)]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)  # ends via the stall guard, never submitting
     env = GitEnv()
@@ -512,7 +511,7 @@ async def test_clean_double_submit_end_gets_no_auto_submission(tmp_path, monkeyp
     fake = FakeCompletion(
         [git_submit_response(), git_submit_response(call_id="call_2")]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = GitEnv()

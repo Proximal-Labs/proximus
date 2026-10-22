@@ -1,8 +1,9 @@
 # Proximus
 
 Proximus is a coding agent for long-horizon tasks, packaged as an external agent
-for [Harbor](https://pypi.org/project/harbor/). It runs a LiteLLM tool loop on the
-orchestrator host and acts in the sandbox only through Harbor's environment
+for [Harbor](https://pypi.org/project/harbor/). It runs a tool loop on the
+orchestrator host, calling models through the vendors' official SDKs
+(`anthropic`, `openai`), and acts in the sandbox only through Harbor's environment
 interface, so it works with any Harbor environment (Docker, Modal, ...).
 
 Status: alpha (`0.1.0a1`), for Harbor `0.24.0`.
@@ -10,7 +11,10 @@ Status: alpha (`0.1.0a1`), for Harbor `0.24.0`.
 ## Install and run
 
 ```sh
-uv pip install "harbor-proximus @ git+https://github.com/Proximal-Labs/proximus"   # next to Harbor
+# Harbor declares litellm but Proximus never uses it; keep it out of the environment.
+echo "litellm; sys_platform == 'never'" > overrides.txt
+uv pip install --overrides overrides.txt harbor==0.24.0 \
+  "harbor-proximus @ git+https://github.com/Proximal-Labs/proximus"
 harbor run ... --agent harbor_proximus:Proximus --model anthropic/claude-opus-5 \
   --ak time_budget_sec=7200
 ```
@@ -108,10 +112,28 @@ Text-only runs do not require vision support.
 
 ## Models and credentials
 
-Any LiteLLM model works (`anthropic/…`, `openai/…`, `openrouter/…`, `gemini/…`,
-or `openai/<model>` with `api_base` for OpenAI-compatible endpoints). There are
-no built-in model presets: pass `reasoning_effort`, `llm_call_kwargs` or
-`model_info` as needed. The context limit comes only from LiteLLM's
+Model names need a provider prefix, which picks the API:
+
+| Prefix | API (SDK) |
+| --- | --- |
+| `anthropic/` | Anthropic Messages (`anthropic`), streamed, with 1h prompt-cache breakpoints |
+| `openai/` | OpenAI Responses (`openai`), stateless with encrypted reasoning |
+| any other (`deepseek/`, `openrouter/`, ...) | Plain OpenAI Chat Completions at that provider's endpoint |
+
+Only the models in the table below are tested; any other model needs its own
+settings checked before an eval. `api_base` points a route at another endpoint
+(a gateway, for example); routes other than `anthropic/` and `openai/` need an
+endpoint and their own key. Each model's own assistant turn (thinking
+signatures, encrypted reasoning) is kept in the history and replayed verbatim.
+
+There are no built-in model presets: pass `reasoning_effort`, `llm_call_kwargs`
+or `model_info` as needed. `llm_call_kwargs` use the API's own parameter names;
+names the SDK does not take go into the request body. Context limits, vision support and prices come from a built-in table,
+`src/harbor_proximus/model_info.json`, which lists only the models Proximus is
+evaluated with (values from the vendors' model and pricing pages):
+`anthropic/claude-opus-5-5`, `anthropic/claude-haiku-5-5`, `openai/gpt-5.6-sol`
+and `openai/gpt-6-astra`. `model_info` describes any other run model, and
+`extra_model_info` other names. The context limit comes only from
 `max_input_tokens`. If it is missing or is not a positive integer, construction
 fails: set `model_info={"max_input_tokens": 200000}` to the model's actual limit.
 There is no context fallback. Unknown models default to no vision and $0 cost.
@@ -120,9 +142,10 @@ Credentials follow Harbor's own agents: the provider's usual variable
 (`ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`, ...) from Harbor's agent env
 (`--ae 'KEY=${VAR}'`), else from your shell. `api_key_env` names a different
 variable for one model. Proximus blanks the variables it uses inside the
-sandbox, so the model cannot read them; Bedrock, SageMaker and Vertex keep
-LiteLLM's own lookup. Never put keys in `--ak` or `llm_call_kwargs`: Harbor saves
-agent options verbatim in job files.
+sandbox, so the model cannot read them. An OpenAI-compatible route never falls
+back to `OPENAI_API_KEY`: without its own key, construction fails. Never put
+keys in `--ak` or `llm_call_kwargs`: Harbor saves agent options verbatim in job
+files.
 
 ## Options and customization
 
@@ -198,10 +221,7 @@ for setup, every option and grading.
 
 ## Limits
 
-- Requires Harbor `0.24.0` and Python 3.12+; tested on Python 3.12 with
-  LiteLLM 1.97.0 and 1.105.1.
-- Installs a small process-wide LiteLLM shim for reasoning-only Responses turns
-  at LLM construction; Harbor itself is not patched.
+- Requires Harbor `0.24.0` and Python 3.12+; tested on Python 3.12.
 - No MCP servers, Harbor skills, session resume or handoff; tasks configuring MCP
   servers or skills fail at setup.
 - Reproducing a published score needs the original model configuration.
@@ -214,10 +234,18 @@ uv run pytest -q          # offline: fake providers, temporary Git repos
 uv run --locked ruff check src tests scripts
 uv run --locked ruff format --check src tests scripts
 uv build && uv run python scripts/verify_wheel.py dist/harbor_proximus-0.1.0a1-py3-none-any.whl
+uv run python scripts/smoke_models.py anthropic/claude-opus-5-5 \
+  openai/gpt-5.6-sol --reasoning-effort high   # live: needs keys, costs cents
 ```
 
+Through the Respan gateway (one key for every provider), point each API at it:
+`--api-key-env RESPAN_API_KEY --anthropic-base https://api.respan.ai/api/anthropic/
+--openai-base https://api.respan.ai/api`. In a run, the same is
+`api_key_env=RESPAN_API_KEY` plus `api_base`.
+
 `verify_wheel.py` reruns the suite against the installed wheel outside the
-checkout; `--litellm-version 1.97.0` checks the lower bound.
+checkout and checks that litellm stays uninstalled. `smoke_models.py` runs a
+tool call and its replay against each live API.
 
 ### Formatting and lint
 We use ruff.

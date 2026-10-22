@@ -1,10 +1,11 @@
 """Install a built wheel outside the source tree and run its offline suite.
 
 Usage: python scripts/verify_wheel.py dist/harbor_proximus-*.whl
-       python scripts/verify_wheel.py dist/harbor_proximus-*.whl --litellm-version 1.97.0
 
-Dependency installation uses the network/cache. Tests block network access and
-use fake providers. Requires uv on PATH; temporary environments are removed.
+Dependency installation uses the network/cache. Harbor's litellm requirement is
+overridden away, as in pyproject.toml, and the script checks it stays absent.
+Tests block network access and use fake providers. Requires uv on PATH;
+temporary environments are removed.
 """
 
 import argparse
@@ -19,7 +20,6 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheel", type=Path)
-    parser.add_argument("--litellm-version")
     args = parser.parse_args()
     wheel = args.wheel.resolve(strict=True)
     root = Path(__file__).resolve().parents[1]
@@ -38,10 +38,20 @@ def main() -> None:
             "pytest-asyncio>=1.2",
             "pillow>=10",
         ]
-        if args.litellm_version:
-            dependencies.append(f"litellm=={args.litellm_version}")
+        overrides = workdir / "overrides.txt"
+        overrides.write_text("litellm; sys_platform == 'never'\n")
         subprocess.run(
-            ["uv", "pip", "install", "--python", str(python), *dependencies], check=True
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--overrides",
+                str(overrides),
+                *dependencies,
+            ],
+            check=True,
         )
         shutil.copytree(
             root / "tests",
@@ -49,13 +59,13 @@ def main() -> None:
             ignore=shutil.ignore_patterns("__pycache__"),
         )
         shutil.copy(root / "pyproject.toml", workdir / "pyproject.toml")
-        test_env = {**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"}
+        test_env = dict(os.environ)
         test_env.pop("PYTHONPATH", None)
         subprocess.run(
             [
                 str(python),
                 "-c",
-                "import harbor_proximus; from pathlib import Path; import sys; assert Path(harbor_proximus.__file__).is_relative_to(Path(sys.prefix)); print('Installed package:', harbor_proximus.__file__)",
+                "import harbor_proximus, importlib.util; from pathlib import Path; import sys; assert Path(harbor_proximus.__file__).is_relative_to(Path(sys.prefix)); assert importlib.util.find_spec('litellm') is None, 'litellm is installed'; print('Installed package:', harbor_proximus.__file__)",
             ],
             cwd=workdir,
             env=test_env,

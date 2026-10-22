@@ -1,20 +1,24 @@
 """Unit tests for the Proximus agent loop (LLM calls mocked)."""
 
+import copy
 import json
 import logging
 import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import litellm
+import httpx
+import openai
 import pytest
 from harbor.agents.factory import AgentFactory
 from harbor.environments.base import ExecResult
+from harbor.llms.base import OutputLengthExceededError
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import AgentConfig
 
 from harbor_proximus import Proximus
+from harbor_proximus.llm import LLM
 from harbor_proximus.prompts import (
     CONTINUE_MESSAGE,
     EMPTY_RESPONSE_MESSAGE,
@@ -23,6 +27,11 @@ from harbor_proximus.prompts import (
     SUBMIT_GUIDANCE,
     TASK_TIMER_GUIDANCE,
     fmt_duration,
+)
+from harbor_proximus.providers.base import (
+    ModelCall,
+    NormalizedToolCall,
+    ParsedResponse,
 )
 from harbor_proximus.timer import DEADLINE_PATH, write_deadline
 from harbor_proximus.tools import EnvironmentGoneError
@@ -49,33 +58,55 @@ class FakeMessage:
         content=None,
         tool_calls=None,
         reasoning_content=None,
-        provider_specific_fields=None,
+        opaque_reasoning=False,
+        native=None,
     ):
         self.content = content
         self.tool_calls = tool_calls
         self.reasoning_content = reasoning_content
-        self.thinking_blocks = None
-        self.provider_specific_fields = provider_specific_fields
+        self.opaque_reasoning = opaque_reasoning
+        self.native = native
 
 
-class FakeChoice:
-    def __init__(self, message, finish_reason="stop"):
-        self.message = message
-        self.finish_reason = finish_reason
+class FakeResponse(ParsedResponse):
+    """A provider's parsed turn, built from chat-style parts."""
 
-
-class FakeUsage:
-    def __init__(self, prompt_tokens: int, completion_tokens: int):
-        self.prompt_tokens = prompt_tokens
-        self.completion_tokens = completion_tokens
-        self.prompt_tokens_details = None
-
-
-class FakeResponse:
     def __init__(self, message, prompt_tokens=100, completion_tokens=10):
-        self.choices = [FakeChoice(message)]
-        self.usage = FakeUsage(prompt_tokens, completion_tokens)
-        self._hidden_params = {"response_cost": 0.01}
+        super().__init__(
+            content=message.content or "",
+            reasoning_content=message.reasoning_content,
+            native=message.native,
+            opaque_reasoning=message.opaque_reasoning,
+            tool_calls=[
+                NormalizedToolCall(call.id, call.function.name, call.function.arguments)
+                for call in message.tool_calls or []
+            ],
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=0.01,
+        )
+
+
+def api_error(status: int, message: str) -> openai.APIStatusError:
+    """A provider HTTP error, as the OpenAI SDK raises it."""
+    request = httpx.Request("POST", "https://api.example.test/v1/chat/completions")
+    response = httpx.Response(status, request=request)
+    error_class = {
+        400: openai.BadRequestError,
+        401: openai.AuthenticationError,
+        404: openai.NotFoundError,
+        413: openai.APIStatusError,
+        429: openai.RateLimitError,
+    }.get(
+        status, openai.InternalServerError if status >= 500 else openai.APIStatusError
+    )
+    return error_class(message, response=response, body={"message": message})
+
+
+def timeout_error() -> openai.APITimeoutError:
+    return openai.APITimeoutError(
+        request=httpx.Request("POST", "https://api.example.test/v1/chat/completions")
+    )
 
 
 def bash_response(command: str, prompt_tokens: int = 100) -> FakeResponse:
@@ -176,32 +207,40 @@ class FakeEnv:
 
 
 class FakeCompletion:
-    """Replaces litellm.acompletion; pops queued responses and records calls.
-    A queued Exception instance is raised instead of returned."""
+    """Replaces the provider call (``LLM._send``); pops queued responses and
+    records each request. A queued Exception instance is raised instead of
+    returned."""
 
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls: list[dict] = []
 
-    async def __call__(self, **kwargs):
-        self.calls.append(kwargs)
+    def install(self, monkeypatch) -> "FakeCompletion":
+        # A plain callable class attribute is not bound, so the LLM calls
+        # this with the ModelCall alone.
+        monkeypatch.setattr(LLM, "_send", self)
+        return self
+
+    async def __call__(self, call: ModelCall):
+        self.calls.append(
+            {
+                "model": call.model,
+                "messages": copy.deepcopy(call.messages),
+                "tools": call.tools,
+                "reasoning_effort": call.reasoning_effort,
+                "temperature": call.temperature,
+                "max_thinking_tokens": call.max_thinking_tokens,
+                "session_id": call.session_id,
+                "timeout": call.timeout,
+                "kwargs": call.kwargs,
+            }
+        )
         if not self.responses:
             raise AssertionError("FakeCompletion ran out of queued responses")
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
-
-
-def make_bridged_agent(tmp_path, **kwargs) -> Proximus:
-    """An agent whose model actually satisfies litellm's chat->Responses
-    bridge gate (OpenAI, gpt-5.4+, reasoning_effort, tools)."""
-    kwargs.setdefault("reasoning_effort", "xhigh")
-    return Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name="openai/gpt-5.4",
-        **kwargs,
-    )
 
 
 def make_agent(tmp_path, **kwargs) -> Proximus:
@@ -213,12 +252,9 @@ def make_agent(tmp_path, **kwargs) -> Proximus:
 
 
 def small_context(monkeypatch, limit: int = 1000) -> None:
-    """Pin the model's context limit (resolved in __init__ from litellm's
-    registry) so a 900-token turn crosses the fixed 0.85 compaction
-    threshold."""
-    monkeypatch.setattr(
-        litellm, "get_model_info", lambda model: {"max_input_tokens": limit}
-    )
+    """Pin the model's context limit (resolved in __init__ from the model
+    table) so a 900-token turn crosses the fixed 0.85 compaction threshold."""
+    monkeypatch.setattr(LLM, "resolve_context_limit", lambda self: limit)
 
 
 def read_trajectory(agent: Proximus) -> dict:
@@ -255,7 +291,7 @@ def test_fmt_duration(secs, expected):
 
 async def test_basic_run_tool_call_then_submit(tmp_path, monkeypatch):
     fake = FakeCompletion([bash_response("echo hi"), *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -295,7 +331,7 @@ async def test_submit_reports_snapshot_time_left_and_confirm_flow(
     tmp_path, monkeypatch
 ):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=7200)
     context = AgentContext()
@@ -331,7 +367,7 @@ async def test_end_gate_rearms_after_intervening_work(tmp_path, monkeypatch):
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=7200)
     context = AgentContext()
@@ -361,7 +397,7 @@ async def test_same_turn_double_submit_does_not_confirm(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([double_submit, submit_response()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=7200)
     await agent.run("Do a task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
@@ -376,7 +412,7 @@ async def test_same_turn_double_submit_does_not_confirm(tmp_path, monkeypatch):
 async def test_confirm_flow_without_time_budget(tmp_path, monkeypatch):
     # Without a budget the flow is identical, minus the time-left sentence.
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     await agent.run("Do a task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
@@ -397,7 +433,7 @@ async def test_submit_empty_arguments_string_is_valid(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([empty_args, submit_response()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -416,7 +452,7 @@ async def test_plain_submit_records_and_continues(tmp_path, monkeypatch):
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)  # no budget: same confirm flow
     env = FakeEnv()
@@ -459,7 +495,7 @@ async def test_submit_ignores_stray_arguments(tmp_path, monkeypatch):
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -478,7 +514,7 @@ async def test_submit_ignores_stray_arguments(tmp_path, monkeypatch):
 
 async def test_failed_record_falls_back_to_final_state(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class BrokenGitEnv(FakeEnv):
         def __init__(self):
@@ -526,7 +562,7 @@ async def test_proactive_compaction(tmp_path, monkeypatch):
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     small_context(monkeypatch)
     agent = make_agent(tmp_path)
@@ -577,7 +613,7 @@ async def test_summary_retries_once_when_model_calls_tools(tmp_path, monkeypatch
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     small_context(monkeypatch)
     agent = make_agent(tmp_path)
@@ -595,7 +631,7 @@ async def test_time_budget_exhausted_ends_run_without_querying(tmp_path, monkeyp
     # The budget check sits at the top of the turn: an exhausted budget ends
     # the run before any LLM call is made (FakeCompletion would raise if hit).
     fake = FakeCompletion([])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     monkeypatch.setattr(Proximus, "_elapsed", lambda self: 4000.0)
 
     agent = make_agent(tmp_path, time_budget_sec=3600)
@@ -610,8 +646,9 @@ async def test_time_budget_exhausted_ends_run_without_querying(tmp_path, monkeyp
 async def test_context_overflow_compacts_and_retries_the_turn(tmp_path, monkeypatch):
     # Turn 1's query overflows the context window: the loop compacts
     # (summary call) and then RETRIES the turn instead of discarding it.
-    overflow = litellm.ContextWindowExceededError(
-        "prompt too long", model="gpt-test", llm_provider="openai"
+    overflow = api_error(
+        400,
+        "This model's maximum context length is 1000 tokens (context_length_exceeded)",
     )
     fake = FakeCompletion(
         [
@@ -621,7 +658,7 @@ async def test_context_overflow_compacts_and_retries_the_turn(tmp_path, monkeypa
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -636,12 +673,13 @@ async def test_context_overflow_compacts_and_retries_the_turn(tmp_path, monkeypa
 
 
 async def test_output_length_exceeded_asks_for_smaller_output(tmp_path, monkeypatch):
-    # finish_reason="length" surfaces as OutputLengthExceededError: the turn
-    # is discarded and the model is asked to re-issue in smaller pieces.
-    truncated = text_response("way too long, cut off mid-")
-    truncated.choices[0].finish_reason = "length"
+    # Adapters raise OutputLengthExceededError on truncation: the turn is
+    # discarded and the model is asked to re-issue in smaller pieces.
+    truncated = OutputLengthExceededError(
+        "hit the limit", truncated_response="way too long, cut off mid-"
+    )
     fake = FakeCompletion([truncated, bash_response("echo hi"), *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -671,7 +709,7 @@ async def test_text_only_turns_are_neither_nagged_nor_terminal(tmp_path, monkeyp
     responses.append(submit_response())
     responses.append(submit_response())
     fake = FakeCompletion(responses)
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -716,7 +754,7 @@ async def test_consecutive_empty_turns_end_the_run(tmp_path, monkeypatch):
 
     # Exactly the limit is queued: FakeCompletion would raise on one more.
     fake = FakeCompletion([empty_response() for _ in range(EMPTY_TURN_STALL_LIMIT)])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -745,7 +783,7 @@ async def test_any_output_resets_the_stall_counter(tmp_path, monkeypatch):
             *[empty_response() for _ in range(3)],
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -767,7 +805,7 @@ async def test_empty_turn_gets_the_directive_closer(tmp_path, monkeypatch):
             *[empty_response() for _ in range(3)],
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -784,12 +822,9 @@ async def test_empty_turn_gets_the_directive_closer(tmp_path, monkeypatch):
 
 
 async def test_opaque_thinking_blocks_do_not_count_as_empty(tmp_path, monkeypatch):
-    # Anthropic can return thinking blocks with no readable text (redacted
-    # thinking): a model still thinking is not provably stuck.
-    blocks_only = FakeResponse(FakeMessage(content=None))
-    blocks_only.choices[0].message.thinking_blocks = [
-        {"type": "redacted_thinking", "data": "opaque"}
-    ]
+    # Anthropic can return thinking blocks with no readable text (redacted or
+    # omitted thinking): a model still thinking is not provably stuck.
+    blocks_only = FakeResponse(FakeMessage(content=None, opaque_reasoning=True))
     fake = FakeCompletion(
         [
             empty_response(),
@@ -798,7 +833,7 @@ async def test_opaque_thinking_blocks_do_not_count_as_empty(tmp_path, monkeypatc
             *[empty_response() for _ in range(3)],
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -817,7 +852,7 @@ async def test_invalid_tool_arguments_reported(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([bad_call, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -849,14 +884,14 @@ def test_default_tool_surface_for_non_vision_models(tmp_path, monkeypatch):
     # Work happens through bash for tool-surface neutrality (matches
     # mini-swe-agent / terminus); list_submissions is read-only bookkeeping
     # and compaction is automatic (no model-facing tool).
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: False)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: False)
     agent = make_agent(tmp_path)
     names = [s["function"]["name"] for s in agent._tool_schemas]
     assert names == ["bash", "list_submissions", "submit"]
 
 
 def test_vision_models_get_view_image_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
     agent = make_agent(tmp_path, enable_view_image=True)
     names = [s["function"]["name"] for s in agent._tool_schemas]
     assert names == ["bash", "view_image", "list_submissions", "submit"]
@@ -864,7 +899,7 @@ def test_vision_models_get_view_image_when_enabled(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("vision", [False, True, None])
 def test_image_tool_is_opt_in_regardless_of_capability(tmp_path, monkeypatch, vision):
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: vision)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: vision)
     agent = make_agent(tmp_path)
     assert "view_image" not in agent._tools
 
@@ -873,19 +908,14 @@ def test_image_tool_is_opt_in_regardless_of_capability(tmp_path, monkeypatch, vi
 def test_enabled_image_tool_rejects_non_vision_or_unknown_model(
     tmp_path, monkeypatch, vision
 ):
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: vision)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: vision)
     with pytest.raises(ValueError, match="requires known vision support.*gpt-test"):
         make_agent(tmp_path, enable_view_image=True)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_vision_probe_failure_is_fatal_only_when_requested(
-    tmp_path, monkeypatch, enabled
-):
-    def supports_vision(model):
-        raise ValueError(f"model not in registry: {model}")
-
-    monkeypatch.setattr(litellm, "supports_vision", supports_vision)
+def test_unknown_vision_capability_is_fatal_only_when_requested(tmp_path, enabled):
+    # The test table lists openai/gpt-test without supports_vision.
     if enabled:
         with pytest.raises(ValueError, match="requires known vision support"):
             make_agent(tmp_path, enable_view_image=True)
@@ -907,8 +937,8 @@ async def test_view_image_attaches_user_image_message(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([view_call, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
 
     png = make_tiny_png()
 
@@ -961,8 +991,8 @@ async def test_image_does_not_split_tool_result_block(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([batch, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
 
     png = make_tiny_png()
 
@@ -1014,12 +1044,13 @@ async def test_image_batch_requests_and_archive_numbering(
     fake = FakeCompletion([view_batch("a", "b"), view_batch("c"), *finish_responses()])
     requests = []
 
-    async def complete(**kwargs):
-        requests.append(copy.deepcopy(kwargs["messages"]))
-        return await fake(**kwargs)
+    class Recording(FakeCompletion):
+        async def __call__(self, call):
+            requests.append(copy.deepcopy(call.messages))
+            return await fake(call)
 
-    monkeypatch.setattr(litellm, "acompletion", complete)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    Recording([]).install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
     png = make_tiny_png()
 
     class ImageEnv(FakeEnv):
@@ -1084,8 +1115,8 @@ async def test_disabled_tool_call_returns_error(tmp_path, monkeypatch):
         )
     )
     fake = FakeCompletion([view_call, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: False)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: False)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -1099,7 +1130,7 @@ async def test_disabled_tool_call_returns_error(tmp_path, monkeypatch):
 
 async def test_no_network_note_in_initial_message(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     env = FakeEnv()
     env.network_policy = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
@@ -1112,7 +1143,7 @@ async def test_no_network_note_in_initial_message(tmp_path, monkeypatch):
 
 async def test_public_network_gets_no_note(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)  # FakeEnv's NetworkPolicy defaults to public
     await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
@@ -1126,7 +1157,7 @@ async def test_time_budget_ends_run_mid_stream(tmp_path, monkeypatch):
     # per-turn budget check trips. Two turns fit inside the budget; the
     # third does not, so exactly two LLM calls are made.
     fake = FakeCompletion([bash_response("echo 1"), bash_response("echo 2")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     monkeypatch.setattr(Proximus, "_elapsed", lambda self: self._run.n_turns * 1500.0)
 
     agent = make_agent(tmp_path, time_budget_sec=3600)
@@ -1147,7 +1178,7 @@ def timer_commands(env: FakeEnv) -> list[str]:
 
 async def test_task_timer_reanchored_to_budget(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv()
@@ -1170,7 +1201,7 @@ async def test_task_timer_never_stopped(tmp_path, monkeypatch):
     # ensure_git keeps .timer out of the repository so it cannot leak into a
     # submission. The single /app/.timer command is the re-anchor itself.
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv()
@@ -1182,7 +1213,7 @@ async def test_task_timer_never_stopped(tmp_path, monkeypatch):
 
 async def test_task_timer_untouched_without_budget(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -1194,7 +1225,7 @@ async def test_task_timer_untouched_without_budget(tmp_path, monkeypatch):
 
 async def test_task_timer_missing_script_is_not_an_error(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv(has_timer=False)
@@ -1209,7 +1240,7 @@ async def test_task_timer_missing_script_is_not_an_error(tmp_path, monkeypatch):
 
 async def test_task_timer_reanchor_failure_does_not_fail_the_run(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class BrokenTimerEnv(FakeEnv):
         async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
@@ -1237,7 +1268,7 @@ def deadline_commands(env: FakeEnv) -> list[str]:
 
 async def test_deadline_written_from_the_budget(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv()
@@ -1273,7 +1304,7 @@ async def test_deadline_skipped_when_the_budget_is_already_spent(remaining_sec):
 
 async def test_deadline_written_when_task_ships_no_timer(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv(has_timer=False)
@@ -1285,7 +1316,7 @@ async def test_deadline_written_when_task_ships_no_timer(tmp_path, monkeypatch):
 
 async def test_deadline_skipped_without_a_budget(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -1297,7 +1328,7 @@ async def test_deadline_skipped_without_a_budget(tmp_path, monkeypatch):
 
 async def test_deadline_write_failure_does_not_fail_the_run(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class BrokenDeadlineEnv(FakeEnv):
         async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
@@ -1326,7 +1357,7 @@ def test_system_prompt_advertises_deadline_outside_submit_guidance(tmp_path):
 
 async def test_only_the_harness_deadline_is_advertised(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600)
     env = FakeEnv()
@@ -1353,7 +1384,7 @@ async def test_only_the_harness_deadline_is_advertised(tmp_path, monkeypatch):
 
 async def test_task_provided_timer_skips_deadline_but_reanchors(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=600, task_provides_timer=True)
     env = FakeEnv()
@@ -1380,7 +1411,7 @@ async def test_task_provided_timer_keeps_budget_pacing(tmp_path, monkeypatch):
     # The flag scopes to in-sandbox clocks only: the budget still opens the
     # initial message and still times the submit guidance.
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, time_budget_sec=7200, task_provides_timer=True)
     await agent.run("Do a task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
@@ -1419,7 +1450,7 @@ async def test_progress_file_reinjected_into_handoff(tmp_path, monkeypatch):
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     small_context(monkeypatch)
     agent = make_agent(tmp_path)
@@ -1444,7 +1475,7 @@ async def test_dead_sandbox_ends_the_run(tmp_path, monkeypatch):
     also propagates; see test_dead_sandbox_at_setup_fails_the_trial.
     """
     fake = FakeCompletion([bash_response(f"echo {n}") for n in range(40)])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class DiesOnFirstToolEnv(FakeEnv):
         """Setup succeeds; the model's first bash call finds the sandbox gone."""
@@ -1476,7 +1507,7 @@ async def test_dead_sandbox_at_setup_fails_the_trial(tmp_path, monkeypatch):
     error propagates out of run() and the trial errors immediately with the
     real cause — no budget burned toward a run that can never submit."""
     fake = FakeCompletion([bash_response("echo 0")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class DeadEnv(FakeEnv):
         async def exec(self, command, **kw):
@@ -1497,7 +1528,7 @@ async def test_transient_tool_errors_do_not_end_the_run(tmp_path, monkeypatch):
     fake = FakeCompletion(
         [bash_response("false"), *([bash_response("echo ok")] * 3), *finish_responses()]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     class FlakyEnv(FakeEnv):
         def __init__(self):
@@ -1519,381 +1550,36 @@ async def test_transient_tool_errors_do_not_end_the_run(tmp_path, monkeypatch):
     assert context.metadata["n_turns"] >= 4
 
 
-def test_cache_breakpoints_use_the_1h_ttl(tmp_path):
-    """Breakpoints carry ttl=1h, on the system prompt and the latest message.
-
-    ttl="1h" bills cache writes at a premium over the 5-minute default and
-    needs no beta header. The premium
-    is paid on the small per-turn increment while an expiry re-reads the
-    whole prefix at full price, so one avoided miss covers ~70 turns of it.
-
-    The second breakpoint lands on the trailing *tool* message here, not the
-    assistant turn before it -- a later anchor caches strictly more. A tool
-    message hosts it as a top-level ``cache_control`` key (the one litellm
-    reads) rather than inside ``content``, so this counts both shapes.
-    """
-    agent = Proximus(logs_dir=tmp_path / "logs", model_name="anthropic/claude-opus-5")
-    wire = agent._llm._apply_prompt_caching(  # type: ignore[attr-defined]
-        [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "task"},
-            {"role": "assistant", "content": "working"},
-            {"role": "tool", "tool_call_id": "c1", "content": "out"},
-        ]
-    )
-    tagged = [
-        blk["cache_control"]
-        for m in wire
-        if isinstance(m.get("content"), list)
-        for blk in m["content"]
-        if isinstance(blk, dict) and "cache_control" in blk
-    ] + [m["cache_control"] for m in wire if m.get("cache_control") is not None]
-    assert len(tagged) == 2, "expected system + latest-message breakpoints"
-    for cache_control in tagged:
-        assert cache_control == {"type": "ephemeral", "ttl": "1h"}
-    assert wire[-1]["role"] == "tool", "the anchor must be the newest message"
-    assert wire[-1]["cache_control"] is not None
-
-
-def test_non_anthropic_models_are_not_tagged(tmp_path):
-    """OpenAI caches automatically and exposes no TTL control -- litellm lists
-    no cache_creation_input_token_cost_above_1hr for it, and its automatic
-    caching already reaches high hit rates untouched."""
-    agent = Proximus(logs_dir=tmp_path / "logs", model_name="openai/gpt-test")
-    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "u"}]
-    assert agent._llm._apply_prompt_caching(msgs) is msgs  # type: ignore[attr-defined]
-
-
-async def test_openai_reasoning_items_round_trip(tmp_path, monkeypatch):
-    """The OpenAI equivalent of Anthropic thinking-block replay.
-
-    litellm bridges gpt-5.4+ tool calls to the Responses API and hands back
-    opaque reasoning items; unless they are replayed the model loses its own
-    chain of thought every turn.
-    """
-    items = [{"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC1"}]
+async def test_native_turns_are_stored_and_replayed(tmp_path, monkeypatch):
+    """A provider's own turn (thinking signatures, encrypted reasoning)
+    rides on the assistant message and reaches the next request unchanged;
+    each adapter replays it (tests/test_providers.py)."""
+    native = {"format": "anthropic", "content": [{"type": "text", "text": "x"}]}
     first = bash_response("echo hi")
-    first.choices[0].message.reasoning_items = items
+    first.native = native
     fake = FakeCompletion([first, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = make_bridged_agent(tmp_path)
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    # Stored on the assistant turn...
-    replayed = [
-        m
-        for m in read_messages(agent)
-        if m.get("role") == "assistant" and m.get("reasoning_items")
-    ]
-    assert replayed and replayed[0]["reasoning_items"] == items
-    # ...and sent back on the following request.
-    assert any(
-        any(m.get("reasoning_items") == items for m in call["messages"])
-        for call in fake.calls[1:]
-    )
-    # The request asks for the encrypted blobs; store=False is what makes
-    # OpenAI attach them (full param set asserted in
-    # test_bridged_request_carries_responses_params).
-    body = fake.calls[0]["extra_body"]
-    assert body["include"] == ["reasoning.encrypted_content"]
-    assert body["store"] is False
-
-
-async def test_reasoning_only_turn_replays_encrypted_cot(tmp_path, monkeypatch):
-    """A Responses turn with encrypted CoT and no message/tool must still
-    replay the reasoning items; dropping them loses the model's CoT after a
-    reasoning-only output."""
-    items = [{"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC1"}]
-    first = FakeResponse(FakeMessage(content=None))
-    first.choices[0].message.reasoning_items = items
-    fake = FakeCompletion([first, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = make_bridged_agent(tmp_path)
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    replayed = [
-        m
-        for m in read_messages(agent)
-        if m.get("role") == "assistant" and m.get("reasoning_items")
-    ]
-    assert replayed and replayed[0]["reasoning_items"] == items
-    assert replayed[0]["content"] == "(no output this turn)"
-    assert any(
-        any(m.get("reasoning_items") == items for m in call["messages"])
-        for call in fake.calls[1:]
-    )
-
-
-@pytest.mark.parametrize(
-    "model_name",
-    ["deepseek/deepseek-v4-pro", "moonshot/kimi-k3"],
-)
-async def test_chat_reasoning_content_round_trip(tmp_path, monkeypatch, model_name):
-    """Thinking chat models receive their complete prior assistant turn."""
-    thought = "I should inspect the workspace before deciding what to change."
-    first = bash_response("echo hi")
-    first.choices[0].message.reasoning_content = thought
-    fake = FakeCompletion([first, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name=model_name,
-        api_key_env=None,
-        model_info={"max_input_tokens": 128000},
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    replayed = [
-        message
-        for message in read_messages(agent)
-        if message.get("role") == "assistant"
-        and message.get("reasoning_content") == thought
-    ]
-    assert replayed
-    assert any(
-        message.get("reasoning_content") == thought
-        for message in fake.calls[1]["messages"]
-    )
-
-
-async def test_gemini_thought_signature_round_trip(tmp_path, monkeypatch):
-    """Gemini needs its opaque thought signature on the next model turn."""
-    fields = {"thought_signatures": ["opaque-signature"]}
-    first = bash_response("echo hi")
-    first.choices[0].message.reasoning_content = "I should inspect the workspace."
-    first.choices[0].message.provider_specific_fields = fields
-    fake = FakeCompletion([first, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name="gemini/test-model",
-        api_key_env=None,
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    assert any(
-        message.get("provider_specific_fields") == fields
-        for message in fake.calls[1]["messages"]
-    )
-
-
-async def test_anthropic_gets_no_reasoning_items_or_extra_body(tmp_path, monkeypatch):
-    fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name="anthropic/claude-opus-test",
-        reasoning_effort="high",
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    assert "extra_body" not in fake.calls[0]
-    assert not [
-        m
-        for m in read_messages(agent)
-        if m.get("role") == "assistant" and m.get("reasoning_items")
-    ]
-
-
-async def test_split_choices_are_merged(tmp_path, monkeypatch):
-    """litellm's Responses bridge splits a text+tool_calls turn across two
-    choices; taking choices[0] would silently drop the tool call."""
-    split = FakeResponse(FakeMessage(content="Diagnosing the failure."))
-    tool_choice = FakeChoice(
-        FakeMessage(
-            content=None,
-            tool_calls=[
-                FakeToolCall("call_x", "bash", json.dumps({"command": "echo hi"}))
-            ],
-        ),
-        finish_reason="tool_calls",
-    )
-    split.choices.append(tool_choice)
-    fake = FakeCompletion([split, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
-    env = FakeEnv()
-    await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
+    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
 
-    # The tool call from the SECOND choice ran, and the prose from the first
-    # is preserved on the assistant turn.
-    assert env.exec_calls == ["echo hi"]
-    assistant = [m for m in read_messages(agent) if m.get("role") == "assistant"]
-    assert "Diagnosing the failure." in str(assistant[0].get("content"))
-    assert assistant[0]["tool_calls"][0]["function"]["name"] == "bash"
+    stored = [m for m in read_messages(agent) if m.get("native")]
+    assert stored and stored[0]["native"] == native
+    assert any(m.get("native") == native for m in fake.calls[1]["messages"])
 
 
-def test_context_limit_is_longest_window_uncapped_by_price_tiers(tmp_path, monkeypatch):
-    # No price-tier capping: the limit is the longest window the registry
+def test_context_limit_is_longest_window_uncapped_by_price_tiers(tmp_path):
+    # No price-tier capping: the limit is the longest window the table
     # reports, tier pricing keys notwithstanding.
-    monkeypatch.setattr(
-        litellm,
-        "get_model_info",
-        lambda model: {
+    agent = make_agent(
+        tmp_path,
+        model_info={
             "max_input_tokens": 1_050_000,
-            "max_tokens": 128_000,
+            "max_output_tokens": 128_000,
             "input_cost_per_token_above_272k_tokens": 1e-05,
         },
     )
-    agent = make_agent(tmp_path)
     assert agent._context_limit == 1_050_000
-
-
-async def test_bridged_request_carries_responses_params(tmp_path, monkeypatch):
-    fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = make_bridged_agent(tmp_path)
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    body = fake.calls[0]["extra_body"]
-    assert body["store"] is False
-    assert body["include"] == ["reasoning.encrypted_content"]
-    # The summary is what puts a human-readable trace in the trajectory.
-    assert body["reasoning_summary"] == "auto"
-    # prompt_cache_key must ride in extra_body: a top-level kwarg is silently
-    # filtered out before any provider sees it.
-    assert body["prompt_cache_key"] == agent._run.session_id
-    assert "prompt_cache_key" not in fake.calls[0]
-
-
-async def test_xai_responses_request_keeps_system(tmp_path, monkeypatch):
-    """xAI Responses needs the shared Responses extra_body, plus list-content
-    system messages so LiteLLM does not drop them as unsupported
-    ``instructions``."""
-    fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(
-        litellm,
-        "get_model_info",
-        lambda model: {
-            "mode": "responses",
-            "litellm_provider": "xai",
-            "max_input_tokens": 200_000,
-        },
-    )
-
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name="xai/grok-test-model",
-        reasoning_effort="high",
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    call = fake.calls[0]
-    assert call["model"] == "xai/grok-test-model"
-    body = call["extra_body"]
-    assert body["store"] is False
-    assert body["include"] == ["reasoning.encrypted_content"]
-    assert body["reasoning_summary"] == "auto"
-    assert body["prompt_cache_key"] == agent._run.session_id
-    systems = [m for m in call["messages"] if m.get("role") == "system"]
-    assert systems
-    assert isinstance(systems[0]["content"], list)
-    assert systems[0]["content"][0]["type"] == "text"
-    assert systems[0]["content"][0]["text"]
-
-
-async def test_no_responses_params_without_reasoning_effort(tmp_path, monkeypatch):
-    # Not bridged -> these params would 400 against /chat/completions.
-    fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = make_agent(tmp_path)
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    assert "extra_body" not in fake.calls[0]
-
-
-async def test_reasoning_merged_across_choices(tmp_path, monkeypatch):
-    # A turn can interleave [reasoning_A, message, reasoning_B, function_call];
-    # replaying only the first drops half the chain of thought.
-    split = FakeResponse(FakeMessage(content="thinking out loud"))
-    split.choices[0].message.reasoning_items = [{"id": "rs_A"}]
-    split.choices[0].message.reasoning_content = "thought A"
-    second = FakeChoice(
-        FakeMessage(
-            content=None,
-            tool_calls=[
-                FakeToolCall("call_y", "bash", json.dumps({"command": "echo hi"}))
-            ],
-        ),
-        finish_reason="tool_calls",
-    )
-    second.message.reasoning_items = [{"id": "rs_B"}]
-    second.message.reasoning_content = "thought B"
-    split.choices.append(second)
-    fake = FakeCompletion([split, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = make_bridged_agent(tmp_path)
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    msgs = read_messages(agent)
-    items = [
-        i
-        for m in msgs
-        if m.get("role") == "assistant"
-        for i in (m.get("reasoning_items") or [])
-    ]
-    assert [i["id"] for i in items] == ["rs_A", "rs_B"]
-    # Prose is split into its own assistant message so the replay transform
-    # cannot drop it, and both summaries reach the trajectory.
-    prose = [m for m in msgs if m.get("role") == "assistant" and m.get("content")]
-    assert any("thinking out loud" in str(m["content"]) for m in prose)
-    steps = read_trajectory(agent)["steps"]
-    assert any(
-        "thought A" in str(s.get("reasoning_content") or "")
-        and "thought B" in str(s.get("reasoning_content") or "")
-        for s in steps
-    )
-
-
-async def test_bare_thinking_turn_is_not_replayed(tmp_path, monkeypatch):
-    """Anthropic rejects an assistant message whose final block is thinking.
-
-    Replaying thinking blocks on a turn with neither tool calls nor text
-    produces exactly that, and the API then rejects the whole conversation
-    mid-run. Only reachable because text-only turns are not capped.
-    """
-    bare = FakeResponse(FakeMessage(content=None))
-    bare.choices[0].message.thinking_blocks = [{"type": "thinking", "thinking": "hm"}]
-    working = bash_response("echo hi")
-    working.choices[0].message.thinking_blocks = [
-        {"type": "thinking", "thinking": "go"}
-    ]
-    fake = FakeCompletion([bare, working, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name="anthropic/claude-opus-test",
-        reasoning_effort="high",
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
-    msgs = [m for m in read_messages(agent) if m.get("role") == "assistant"]
-    # Bare turns get explicit placeholder text: content=None with no tool_calls
-    # is a 400 at some providers ("content or tool_calls must be set").
-    bare_turns = [
-        m
-        for m in msgs
-        if not m.get("tool_calls") and m.get("content") == "(no output this turn)"
-    ]
-    assert bare_turns, "the prose/thinking-only turn should still be recorded"
-    assert all("thinking_blocks" not in m for m in bare_turns), (
-        "a turn with no tool calls and no text must not carry thinking blocks"
-    )
-    # ...while a turn that DOES call a tool still replays them (Anthropic
-    # requires that for tool-use continuity).
-    tool_turns = [m for m in msgs if m.get("tool_calls")]
-    assert any(m.get("thinking_blocks") for m in tool_turns)
 
 
 # ----- environment-gone handling -----
@@ -1931,7 +1617,7 @@ async def test_env_gone_ends_run_on_first_typed_error(tmp_path, monkeypatch):
     # One typed EnvironmentGoneError ends the run: no second LLM call, no
     # marker counting, and the loss is recorded in the metadata.
     fake = FakeCompletion([bash_response("boom")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -1960,7 +1646,7 @@ async def test_env_gone_ends_run_on_first_typed_error(tmp_path, monkeypatch):
 
 async def test_exec_connection_loss_fails_after_one_model_turn(tmp_path, monkeypatch):
     fake = FakeCompletion([bash_response("boom")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     context = AgentContext()
@@ -1992,7 +1678,7 @@ async def test_env_gone_mid_batch_fills_remaining_results(tmp_path, monkeypatch)
         )
     )
     fake = FakeCompletion([double_bash])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = DyingEnv("boom")
@@ -2051,7 +1737,7 @@ async def test_disarm_is_announced_on_the_cancelling_call(tmp_path, monkeypatch)
             submit_response(call_id="confirm"),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = FakeEnv()
@@ -2084,8 +1770,8 @@ async def test_viewed_image_saved_to_disk_and_referenced_in_step(tmp_path, monke
         )
     )
     fake = FakeCompletion([view_call, *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
     png = make_tiny_png()
 
     class ImageEnv(FakeEnv):
@@ -2146,8 +1832,8 @@ async def test_request_too_large_evicts_newest_image_and_retries(tmp_path, monke
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
 
     png = make_tiny_png()
 
@@ -2216,8 +1902,8 @@ async def test_invalid_image_is_removed_and_error_returned_to_model(
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
 
     png = make_tiny_png()
 
@@ -2291,8 +1977,8 @@ async def test_image_count_limit_compacts_instead_of_repeated_eviction(
             *finish_responses(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+    fake.install(monkeypatch)
+    monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
 
     png = make_tiny_png()
 
@@ -2335,7 +2021,7 @@ async def test_request_too_large_without_images_is_fatal(tmp_path, monkeypatch):
     fake = FakeCompletion(
         [RuntimeError("Request body size exceeds maximum allowed size: 10485760 bytes")]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     with pytest.raises(llm_mod.RequestTooLargeError):
@@ -2352,12 +2038,12 @@ async def test_provider_outage_past_budget_fails_the_run(tmp_path, monkeypatch):
 
     calls = {"n": 0}
 
-    async def down(**kwargs):
+    async def down(self, call):
         calls["n"] += 1
         await asyncio.sleep(0.15)  # burns past the tiny budget on attempt 1
-        raise litellm.exceptions.Timeout("provider down", "openai", "m")
+        raise timeout_error()
 
-    monkeypatch.setattr(litellm, "acompletion", down)
+    monkeypatch.setattr(LLM, "_send", down)
     monkeypatch.setattr("tenacity.wait_random_exponential", lambda **_: 0)
 
     agent = make_agent(tmp_path, time_budget_sec=0.1)
@@ -2372,7 +2058,7 @@ async def test_env_gone_skips_restore(tmp_path, monkeypatch):
     # FIRST so a winner exists: without one, restore_winner() returns early
     # and the skip would be untestable.
     fake = FakeCompletion([submit_response(), bash_response("boom")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path)
     env = DyingEnv("boom")
@@ -2394,7 +2080,7 @@ async def test_finalize_only_on_confirmed_submit(tmp_path, monkeypatch):
     from harbor_proximus.submissions import Submissions
 
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     restore = AsyncMock(return_value=True)
     monkeypatch.setattr(Submissions, "restore_winner", restore)
     agent = make_agent(
@@ -2412,7 +2098,7 @@ async def test_finalize_only_skips_budget_exit(tmp_path, monkeypatch):
     from harbor_proximus.submissions import Submissions
 
     fake = FakeCompletion([])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     monkeypatch.setattr(Proximus, "_elapsed", lambda self: 4000.0)
     restore = AsyncMock(return_value=True)
     monkeypatch.setattr(Submissions, "restore_winner", restore)
@@ -2433,7 +2119,7 @@ async def test_finalize_only_skips_budget_exit(tmp_path, monkeypatch):
 
 async def test_confirmed_submit_never_auto_pins_a_new_winner(tmp_path, monkeypatch):
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
 
     agent = make_agent(tmp_path, auto_submit_on_exit=True, finalize_only_on_submit=True)
     auto_submit = AsyncMock()

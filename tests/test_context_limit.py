@@ -1,57 +1,41 @@
-"""Context capacity has one source: the registry's max_input_tokens."""
+"""Context capacity has one source: the model table's max_input_tokens."""
 
-import litellm
 import pytest
 
 from harbor_proximus import Proximus
 
 
 @pytest.mark.parametrize("output_limit", [1024, 500_000])
-def test_context_uses_only_input_limit(tmp_path, monkeypatch, output_limit):
-    monkeypatch.setattr(
-        litellm,
-        "get_model_info",
-        lambda model: {"max_input_tokens": 32000, "max_tokens": output_limit},
+def test_context_uses_only_input_limit(tmp_path, output_limit):
+    agent = Proximus(
+        logs_dir=tmp_path,
+        model_name="openai/context-test",
+        model_info={"max_input_tokens": 32000, "max_output_tokens": output_limit},
     )
-    agent = Proximus(logs_dir=tmp_path, model_name="openai/context-test")
     assert agent._context_limit == 32000
 
 
 @pytest.mark.parametrize("limit", [None, 0, -1, True, False, 1.5, "32000"])
-def test_invalid_input_limit_fails_at_construction(tmp_path, monkeypatch, limit):
-    monkeypatch.setattr(
-        litellm,
-        "get_model_info",
-        lambda model: {"max_input_tokens": limit, "max_tokens": 200_000},
-    )
+def test_invalid_input_limit_fails_at_construction(tmp_path, limit):
     with pytest.raises(
         ValueError, match=r"No valid max_input_tokens for 'openai/context-test'\."
     ):
-        Proximus(logs_dir=tmp_path, model_name="openai/context-test")
+        Proximus(
+            logs_dir=tmp_path,
+            model_name="openai/context-test",
+            model_info={"max_input_tokens": limit, "max_output_tokens": 200_000},
+        )
 
 
-def test_missing_input_limit_does_not_use_max_tokens(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        litellm, "get_model_info", lambda model: {"max_tokens": 200_000}
-    )
+def test_missing_input_limit_does_not_use_output_limit(tmp_path):
     with pytest.raises(
         ValueError, match=r"No valid max_input_tokens for 'openai/context-test'\."
     ):
-        Proximus(logs_dir=tmp_path, model_name="openai/context-test")
-
-
-def test_registry_error_identifies_model_and_preserves_cause(tmp_path, monkeypatch):
-    error = RuntimeError("registry lookup failed")
-
-    def failed_lookup(model):
-        raise error
-
-    monkeypatch.setattr(litellm, "get_model_info", failed_lookup)
-    with pytest.raises(
-        ValueError, match=r"No valid max_input_tokens for 'openai/context-test'\."
-    ) as exc:
-        Proximus(logs_dir=tmp_path, model_name="openai/context-test")
-    assert exc.value.__cause__ is error
+        Proximus(
+            logs_dir=tmp_path,
+            model_name="openai/context-test",
+            model_info={"max_output_tokens": 200_000},
+        )
 
 
 def test_unknown_model_requires_explicit_input_limit(tmp_path):
@@ -66,3 +50,8 @@ def test_unknown_model_requires_explicit_input_limit(tmp_path):
         model_info={"max_input_tokens": 64000},
     )
     assert agent._context_limit == 64000
+
+
+def test_builtin_table_knows_current_models(tmp_path):
+    agent = Proximus(logs_dir=tmp_path, model_name="anthropic/claude-opus-5-5")
+    assert agent._context_limit == 1_000_000

@@ -2,7 +2,6 @@
 
 import asyncio
 
-import litellm
 from harbor.models.agent.context import AgentContext
 
 from tests.test_proximus_loop import (
@@ -43,7 +42,7 @@ async def test_multiple_bash_calls_finish_in_order(tmp_path, monkeypatch):
             done_response(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(tmp_path, submission_mode="none")
     await agent.run("Work in order", OrderedEnv(), AgentContext())
     assert events == [

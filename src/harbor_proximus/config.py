@@ -3,7 +3,7 @@ from typing import Any, Literal, Self
 
 from harbor.agents.options import AgentOptions
 from harbor.utils.templating import render_prompt_template
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 
 # Seconds kept free at the end of the time budget: bash commands time out this
 # long before the budget runs out, and a model request always gets at least
@@ -65,17 +65,22 @@ class ProximusConfig(AgentOptions):
     example caches and checkpoints that grading ignores anyway). Written to
     ``.git/info/exclude``, so the visible workspace is unchanged."""
 
-    litellm_model_info: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    """Extra LiteLLM model entries, keyed by model name, for models LiteLLM
-    does not know. They set the context limit, vision support (needed for
-    ``view_image``) and prices. A positive integer ``max_input_tokens`` is
-    required; there is no context fallback. Unknown models get no vision and
-    zero cost. For an ``openai/`` route, add both ``openai/<model>`` and
-    ``<model>``. ``model_info`` is the shorthand for the run's model."""
+    extra_model_info: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("extra_model_info", "litellm_model_info"),
+    )
+    """Model entries, keyed by model name, for models the built-in table does
+    not know (for example the model a server-side fallback answered with).
+    They set the context limit, vision support (needed for ``view_image``) and
+    prices, with the built-in table's keys. Unknown models get no vision and
+    zero cost. ``model_info`` is the shorthand for the run's model. The old
+    name ``litellm_model_info`` is still accepted."""
 
     llm_call_kwargs: dict[str, Any] = Field(default_factory=dict)
-    """Extra arguments for every model request (for example ``max_tokens``,
-    ``timeout`` or ``extra_body``). They override all other request settings."""
+    """Extra arguments for every model request, in the API's own names (for
+    example ``max_tokens``, ``timeout``, ``stream`` or ``extra_body``). They
+    override all other request settings; names the SDK does not know are sent
+    in the request body."""
 
     max_turns: int | None = Field(default=None, ge=1)
     """Maximum number of loop iterations, including retries. Reaching it ends
@@ -113,7 +118,7 @@ class ProximusConfig(AgentOptions):
     with ``reasoning_effort``."""
 
     model_info: dict[str, Any] | None = None
-    """LiteLLM model info for the run's model (context limit, vision, prices).
+    """Model info for the run's model (context limit, vision, prices).
     Set ``max_input_tokens`` to a positive integer if the registry has no valid
     input limit. This is the only field used for the context limit."""
 
@@ -141,6 +146,6 @@ class ProximusConfig(AgentOptions):
         if self.max_thinking_tokens is not None and self.reasoning_effort is not None:
             raise ValueError(
                 "set either max_thinking_tokens or reasoning_effort, not both: "
-                "LiteLLM maps both onto the provider's thinking setting"
+                "both map onto the provider's thinking setting"
             )
         return self
