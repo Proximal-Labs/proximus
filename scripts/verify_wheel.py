@@ -3,8 +3,10 @@
 Usage: python scripts/verify_wheel.py dist/harbor_proximus-*.whl
        python scripts/verify_wheel.py dist/harbor_proximus-*.whl --litellm-version 1.97.0
 
-Dependency installation uses the network/cache. Tests block network access and
-use fake providers. Requires uv on PATH; temporary environments are removed.
+Dependencies are installed from the network/cache, constrained to the versions in
+uv.lock (litellm is left out of the constraints when --litellm-version is given).
+Tests block network access and use fake providers. Requires uv on PATH;
+temporary environments are removed.
 """
 
 import argparse
@@ -32,6 +34,13 @@ def main() -> None:
         subprocess.run(
             ["uv", "venv", "--python", sys.executable, str(environment)], check=True
         )
+        locked = subprocess.run(
+            ["uv", "export", "--frozen", "--no-hashes", "--no-emit-project"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
         dependencies = [
             str(wheel),
             "pytest>=8.4.2",
@@ -39,9 +48,22 @@ def main() -> None:
             "pillow>=10",
         ]
         if args.litellm_version:
+            locked = [line for line in locked if not line.startswith("litellm==")]
             dependencies.append(f"litellm=={args.litellm_version}")
+        constraints = workdir / "constraints.txt"
+        constraints.write_text("\n".join(locked) + "\n")
         subprocess.run(
-            ["uv", "pip", "install", "--python", str(python), *dependencies], check=True
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                "--constraint",
+                str(constraints),
+                *dependencies,
+            ],
+            check=True,
         )
         shutil.copytree(
             root / "tests",
