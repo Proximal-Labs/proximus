@@ -9,7 +9,8 @@ authors = [{ name = "Proximal AI, Inc." }]
 license-files = ["LICENSE", "NOTICE"]
 dependencies = [
     "harbor==0.24.0",
-    "litellm>=1.97.0,<2",
+    "anthropic>=1,<2",
+    "openai>=2,<3",
     "pydantic>=2.11.7,<3",
     "tenacity>=9.1.2,<10",
     "pillow>=10",
@@ -24,6 +25,12 @@ packages = ["src/harbor_proximus"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/tests", "/scripts", "/examples", "/README.md", "/pyproject.toml", "/LICENSE", "/NOTICE", "/uv.lock"]
+
+[tool.uv]
+# Harbor declares litellm, but only imports it for agents Proximus never loads
+# and for model names without a provider prefix, which Proximus rejects.
+# Keep it out of the environment entirely (supply-chain exposure).
+override-dependencies = ["litellm; sys_platform == 'never'"]
 
 [dependency-groups]
 dev = [

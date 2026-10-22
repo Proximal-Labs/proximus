@@ -4,7 +4,6 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
-import litellm
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
@@ -75,7 +74,7 @@ async def test_done_ends_once_and_skips_later_calls(tmp_path, monkeypatch):
             done_response(FakeToolCall("late", "bash", '{"command":"touch bad"}')),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(tmp_path, submission_mode="none", time_budget_sec=1200)
     context = AgentContext()
     env = NoGitEnv()
@@ -101,7 +100,7 @@ async def test_other_exits_never_run_git(tmp_path, monkeypatch, ending):
         "cancelled": [asyncio.CancelledError()],
     }[ending]
     fake = FakeCompletion(responses)
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(
         tmp_path,
         submission_mode="none",
@@ -133,7 +132,7 @@ async def test_compaction_keeps_done_and_has_no_git_advice(tmp_path, monkeypatch
             done_response(),
         ]
     )
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(tmp_path, submission_mode="none")
     context = AgentContext()
     await agent.run("Write the requested file.", NoGitEnv(), context)
@@ -176,7 +175,7 @@ async def test_real_workspace_files_survive_done_or_turn_limit(
 
     responses = [bash_response(command)] + ([done_response()] if finish else [])
     fake = FakeCompletion(responses)
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(tmp_path, submission_mode="none", max_turns=2 if finish else 1)
     env = FileEnv()
     env.task_env_config.workdir = str(workspace)

@@ -2,14 +2,12 @@
 ``task_agent_kwargs`` and Harbor's agent factory, bad config fails before any
 sandbox exists, and ``--ak`` values parse the way ``harbor run`` parses them."""
 
-import copy
 import json
 import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
-import litellm
 import pytest
 from harbor.agents.factory import AgentFactory
 from harbor.cli.utils import parse_kwargs
@@ -17,19 +15,11 @@ from harbor.models.trial.config import AgentConfig
 
 from harbor_proximus import Proximus, task_agent_kwargs
 from harbor_proximus.config import ProximusConfig
+from harbor_proximus.llm import LLM
 
 MODEL = "openai/gpt-test"
 # Optional: the tasks/ directory of a FrontierSWE v2 checkout.
 FRONTIER_SWE_TASKS = os.environ.get("FRONTIER_SWE_TASKS")
-
-
-@pytest.fixture(autouse=True)
-def restore_litellm_model_map():
-    """model_info/litellm_model_info register into litellm's global map."""
-    saved = copy.deepcopy(litellm.model_cost)
-    yield
-    litellm.model_cost.clear()
-    litellm.model_cost.update(saved)
 
 
 def toml_value(value: Any) -> str:
@@ -80,7 +70,7 @@ FIELD_VALUES: dict[str, Any] = {
     "reasoning_effort": "high",
     "api_key_env": "PROXIMUS_TIER0_KEY",
     "workspace_git_excludes": ["node_modules", "target"],
-    "litellm_model_info": {
+    "extra_model_info": {
         MODEL: {"max_input_tokens": 50000, "supports_vision": True},
         "gpt-test": {"max_input_tokens": 50000, "input_cost_per_token": 1e-06},
     },
@@ -112,7 +102,7 @@ def test_every_field_round_trips_through_task_toml_and_factory(
 ):
     value = FIELD_VALUES[field]
     if field == "enable_view_image":
-        monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
+        monkeypatch.setattr(LLM, "supports_vision", lambda self: True)
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     expected = value
@@ -135,13 +125,13 @@ def test_every_field_round_trips_through_task_toml_and_factory(
         assert {"bash", "submit"} <= set(agent._tools)
     if field == "model_info":
         assert agent._context_limit == 77777
-    if field == "litellm_model_info":
+    if field == "extra_model_info":
         assert agent._context_limit == 50000
         assert "view_image" not in agent._tools
     if field == "enable_view_image":
         assert "view_image" in agent._tools
     if field == "api_key_env":
-        assert agent._llm._api_key == "roundtrip-key"
+        assert agent._llm.provider.client.api_key == "roundtrip-key"
 
 
 def test_all_fields_together(tmp_path, monkeypatch):

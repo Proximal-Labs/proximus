@@ -7,7 +7,6 @@ import subprocess
 import sys
 from pathlib import PurePosixPath
 
-import litellm
 import pytest
 from harbor.agents.factory import AgentFactory
 from harbor.models.agent.context import AgentContext
@@ -27,7 +26,7 @@ from tests.test_proximus_loop import FakeCompletion, FakeEnv, finish_responses
 async def test_factory_run_and_artifacts(tmp_path, monkeypatch, selector):
     assert importlib.metadata.version("harbor") == "0.24.0"
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     config = AgentConfig(
         **selector,
         model_name="openai/test-model",
@@ -101,7 +100,8 @@ def test_user_registry_controls_context_and_vision(tmp_path):
     agent = Proximus(
         logs_dir=tmp_path,
         model_name=model,
-        litellm_model_info={model: entry, model.split("/", 1)[1]: entry},
+        # The pre-1.0 option name, still accepted for existing job configs.
+        litellm_model_info={model: entry},
         reasoning_effort="high",
         enable_view_image=True,
     )
@@ -121,7 +121,7 @@ def test_host_credentials_from_harbor_agent_env(tmp_path, monkeypatch):
         ),
         logs_dir=tmp_path,
     )
-    assert agent._llm._api_key == "configured-key"
+    assert agent._llm.provider.client.api_key == "configured-key"
     assert "configured-key" not in agent.config.model_dump_json()
 
 
@@ -138,13 +138,17 @@ def test_provider_credentials_follow_harbor_agent_env(tmp_path, monkeypatch):
             logs_dir=tmp_path,
         )
 
-    # Host-only credentials stay with LiteLLM's own lookup.
-    assert make({})._llm._api_key is None
+    # Host credentials are used but not blanked: the sandbox never had them.
+    host = make({})._llm
+    assert host.provider.client.api_key == "host-key"
+    assert host.consumed_env_keys == frozenset()
+    # Anthropic's SDK knows its endpoint; Harbor's default would double /v1.
+    assert str(host.provider.client.base_url).rstrip("/") == "https://api.anthropic.com"
     configured = make(
         {"ANTHROPIC_API_KEY": "agent-key", "ANTHROPIC_BASE_URL": "https://proxy"}
     )
-    assert configured._llm._api_key == "agent-key"
-    assert configured._llm._api_base == "https://proxy"
+    assert configured._llm.provider.client.api_key == "agent-key"
+    assert str(configured._llm.provider.client.base_url).rstrip("/") == "https://proxy"
 
 
 def test_options_are_described_in_the_harbor_schema():
@@ -152,26 +156,26 @@ def test_options_are_described_in_the_harbor_schema():
     assert all(field.get("description") for field in fields.values())
 
 
-def test_import_is_offline_and_does_not_patch_litellm(tmp_path):
+def test_import_and_construction_are_offline_and_never_load_litellm(tmp_path):
+    # Harbor still declares litellm; Proximus must never import it, even
+    # where it is installed.
     script = """
-import socket
+import socket, sys
+from pathlib import Path
 def blocked(*args, **kwargs):
-    raise AssertionError('Unexpected import-time network access')
+    raise AssertionError('Unexpected network access')
 socket.socket.connect = blocked
 socket.getaddrinfo = blocked
-import litellm
-from litellm.completion_extras.litellm_responses_transformation.transformation import LiteLLMResponsesTransformationHandler as Handler
-original = Handler._convert_response_output_to_choices
-registry_size = len(litellm.model_cost)
 from harbor_proximus import Proximus
-assert Handler._convert_response_output_to_choices is original
-assert len(litellm.model_cost) == registry_size
+for model in ('anthropic/claude-opus-5-5', 'anthropic/claude-haiku-5-5', 'openai/gpt-5.6-sol', 'openai/gpt-6-astra'):
+    Proximus(logs_dir=Path(sys.argv[1]), model_name=model, reasoning_effort='high')
+assert 'litellm' not in sys.modules, 'litellm was imported'
 assert Proximus.name() == 'proximus'
 """
     subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", script, str(tmp_path / "logs")],
         cwd=tmp_path,
-        env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"},
+        env=dict(os.environ),
         check=True,
         timeout=30,
         capture_output=True,
@@ -206,22 +210,28 @@ def test_consumed_credentials_are_reported_for_blanking(tmp_path, monkeypatch):
         api_key_env="MY_KEY",
     )
     # api_key_env no longer disables agent-env base URLs.
-    assert named._llm._api_key == "k2"
-    assert named._llm._api_base == "https://gw"
+    assert named._llm.provider.client.api_key == "k2"
+    assert str(named._llm.provider.client.base_url).rstrip("/") == "https://gw"
     assert named._llm.consumed_env_keys == {"MY_KEY", "OPENAI_BASE_URL"}
 
 
-def test_cloud_credentials_are_not_sent_as_api_keys(tmp_path):
-    agent = _agent(tmp_path, "bedrock/test-model", {"AWS_ACCESS_KEY_ID": "AKIATEST"})
-    assert agent._llm._api_key is None
-    assert agent._llm.consumed_env_keys == frozenset()
+def test_routes_without_an_endpoint_are_rejected_up_front(tmp_path):
+    # Bedrock/Vertex/SageMaker/Azure need cloud SDK auth, not an API key.
+    with pytest.raises(ValueError, match="api_base"):
+        _agent(tmp_path, "bedrock/test-model", {"AWS_ACCESS_KEY_ID": "AKIATEST"})
+
+
+def test_bare_model_names_are_rejected(tmp_path):
+    # Routing never guesses a provider (Harbor would ask litellm).
+    with pytest.raises(ValueError, match="provider prefix"):
+        _agent(tmp_path, "gpt-4o", {})
 
 
 async def test_run_blanks_consumed_credentials_in_the_sandbox(tmp_path, monkeypatch):
     import contextlib
 
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     scopes = []
 
     class ScopedEnv(FakeEnv):
@@ -235,16 +245,17 @@ async def test_run_blanks_consumed_credentials_in_the_sandbox(tmp_path, monkeypa
     assert scopes == [{"OPENAI_API_KEY": ""}]
 
 
-def test_model_info_keeps_known_bare_names(tmp_path):
-    known = "gpt-4o"
-    before = litellm.get_model_info(known)["max_input_tokens"]
-    _agent(
+def test_model_info_stays_with_its_agent(tmp_path):
+    # Overrides are per agent: another run of the bare name keeps the table.
+    custom = _agent(
         tmp_path,
-        f"openrouter/{known}",
-        {},
-        model_info={"max_input_tokens": 1234, "litellm_provider": "openrouter"},
+        "openrouter/openai/gpt-5.6-sol",
+        {"OPENROUTER_API_KEY": "k"},
+        model_info={"max_input_tokens": 1234},
     )
-    assert litellm.get_model_info(known)["max_input_tokens"] == before
+    assert custom._context_limit == 1234
+    plain = _agent(tmp_path, "openai/gpt-5.6-sol", {"OPENAI_API_KEY": "k"})
+    assert plain._context_limit == 922_000
 
 
 def test_resolve_credentials_unit():

@@ -2,7 +2,6 @@
 
 import json
 
-import litellm
 import pytest
 from harbor.llms.base import ContextLengthExceededError
 from harbor.models.agent.context import AgentContext
@@ -15,6 +14,7 @@ from tests.test_proximus_loop import (
     FakeMessage,
     FakeResponse,
     FakeToolCall,
+    api_error,
     bash_response,
     finish_responses,
     make_agent,
@@ -38,7 +38,7 @@ def test_defaults_are_unchanged(tmp_path):
 
 async def test_max_turns_ends_the_run_with_the_exit_submit(tmp_path, monkeypatch):
     fake = FakeCompletion([bash_response("one"), bash_response("two")])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = make_agent(tmp_path, max_turns=2)
     env = FakeEnv()
     context = AgentContext()
@@ -55,17 +55,15 @@ async def test_compaction_threshold_and_enable_summarize(tmp_path, monkeypatch):
         fake = FakeCompletion(
             [bash_response("ls", prompt_tokens=900), *finish_responses()]
         )
-        monkeypatch.setattr(litellm, "acompletion", fake)
+        fake.install(monkeypatch)
         agent = make_agent(tmp_path, **kwargs)
         await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
         assert len(fake.calls) == 3  # no summary call
 
 
 async def test_overflow_without_summarize_ends_the_run(tmp_path, monkeypatch):
-    overflow = litellm.ContextWindowExceededError(
-        "prompt too long", model="gpt-test", llm_provider="openai"
-    )
-    monkeypatch.setattr(litellm, "acompletion", FakeCompletion([overflow]))
+    overflow = api_error(400, "prompt is too long: 250000 tokens > 200000 maximum")
+    FakeCompletion([overflow]).install(monkeypatch)
     agent = make_agent(tmp_path, enable_summarize=False)
     with pytest.raises(ContextLengthExceededError):
         await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
@@ -84,7 +82,7 @@ def test_disallowed_tools(tmp_path):
 async def test_prompt_template_wraps_the_instruction(tmp_path, monkeypatch):
     template = tmp_path / "prompt.j2"
     template.write_text("Solve carefully.\n\n{{ instruction }}")
-    monkeypatch.setattr(litellm, "acompletion", FakeCompletion(finish_responses()))
+    FakeCompletion(finish_responses()).install(monkeypatch)
     agent = make_agent(tmp_path, prompt_template_path=str(template))
     await agent.run("Fix the bug", FakeEnv(), AgentContext())  # type: ignore[arg-type]
     assert "Solve carefully.\n\nFix the bug" in read_messages(agent)[1]["content"]
@@ -92,52 +90,27 @@ async def test_prompt_template_wraps_the_instruction(tmp_path, monkeypatch):
         make_agent(tmp_path, prompt_template_path=str(tmp_path / "missing.j2"))
 
 
-async def test_llm_shorthands_and_llm_call_kwargs_win(tmp_path, monkeypatch):
+async def test_llm_shorthands_reach_every_request(tmp_path, monkeypatch):
+    # How each API spells them, and llm_call_kwargs winning, is covered per
+    # adapter in tests/test_providers.py.
     fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = Proximus(
         logs_dir=tmp_path / "logs",
         model_name="anthropic/claude-test",
         temperature=0.2,
         api_base="https://option",
         max_thinking_tokens=2048,
-        llm_call_kwargs={"api_base": "https://call-kwargs"},
-        model_info={"max_input_tokens": 54321, "litellm_provider": "anthropic"},
+        llm_call_kwargs={"max_tokens": 1000},
+        model_info={"max_input_tokens": 54321},
     )
     assert agent._context_limit == 54321
+    assert str(agent._llm.provider.client.base_url).rstrip("/") == "https://option"
     await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-    call = fake.calls[0]
-    assert call["temperature"] == 0.2
-    assert call["thinking"] == {"type": "enabled", "budget_tokens": 2048}
-    assert call["api_base"] == "https://call-kwargs"
-
-
-@pytest.mark.parametrize(
-    ("model_name", "expects_thinking"),
-    [
-        ("anthropic/claude-test", True),
-        ("openai/claude-custom", True),
-        ("openai/Claude-custom", True),
-        ("openai/gpt-test", False),
-    ],
-)
-async def test_thinking_budget_model_names(
-    tmp_path, monkeypatch, model_name, expects_thinking
-):
-    fake = FakeCompletion(finish_responses())
-    monkeypatch.setattr(litellm, "acompletion", fake)
-    agent = Proximus(
-        logs_dir=tmp_path / "logs",
-        model_name=model_name,
-        max_thinking_tokens=2048,
-    )
-    await agent.run("Task", FakeEnv(), AgentContext())  # type: ignore[arg-type]
-
     for call in fake.calls:
-        if expects_thinking:
-            assert call["thinking"] == {"type": "enabled", "budget_tokens": 2048}
-        else:
-            assert "thinking" not in call
+        assert call["temperature"] == 0.2
+        assert call["max_thinking_tokens"] == 2048
+        assert call["kwargs"] == {"max_tokens": 1000}
 
 
 class CountArgs(BaseModel):
@@ -177,7 +150,7 @@ async def test_subclass_hooks(tmp_path, monkeypatch):
         prompt_tokens=900,
     )
     fake = FakeCompletion([count, text_response("summary"), *finish_responses()])
-    monkeypatch.setattr(litellm, "acompletion", fake)
+    fake.install(monkeypatch)
     agent = CustomProximus(logs_dir=tmp_path / "logs", model_name="openai/gpt-test")
     env = FakeEnv()
     await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
