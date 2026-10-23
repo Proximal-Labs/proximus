@@ -1,7 +1,6 @@
 """Terminus-style options and subclass hooks; unset, each keeps the default behavior."""
 
 import json
-from pathlib import Path
 
 import pytest
 from harbor.llms.base import ContextLengthExceededError
@@ -32,7 +31,7 @@ def tool_names(agent: Proximus) -> list[str]:
 
 def test_defaults_are_unchanged(tmp_path):
     agent = make_agent(tmp_path)
-    assert agent._system_prompt == prompts.system_prompt(False)
+    assert agent._system_prompt == prompts.system_prompt(agent.config)
     assert agent.summary_request() == prompts.SUMMARY_REQUEST
     assert tool_names(agent) == ["bash", "list_submissions", "submit"]
 
@@ -164,10 +163,7 @@ async def test_subclass_hooks(tmp_path, monkeypatch):
     assert fake.calls[1]["messages"][-1]["content"] == "Summarize briefly."
 
 
-class PathsProximus(Proximus):
-    progress_file = Path("/tmp/notes.md")
-    output_prefix = "/tmp/output-"
-
+class HandoffProximus(Proximus):
     def handoff_message(self, summary, progress) -> str:
         return f"[handoff] {summary}"
 
@@ -177,14 +173,19 @@ async def test_sandbox_paths_and_handoff_hook(tmp_path, monkeypatch):
     turns = [bash_response("ls", prompt_tokens=900), text_response("summary")]
     fake = FakeCompletion([*turns, *finish_responses()])
     fake.install(monkeypatch)
-    agent = PathsProximus(logs_dir=tmp_path / "logs", model_name="openai/gpt-test")
+    agent = HandoffProximus(
+        logs_dir=tmp_path / "logs",
+        model_name="openai/gpt-test",
+        progress_file="/tmp/notes.md",
+        bash_output_file_prefix="/tmp/output-",
+    )
     env = FakeEnv()
     await agent.run("Task", env, AgentContext())  # type: ignore[arg-type]
 
     assert "/tmp/notes.md" in agent._system_prompt
     assert "mkdir -p /tmp" in env.exec_calls
     assert any("/tmp/notes.md" in command for command in env.exec_calls)
-    assert agent._executor._output_prefix == "/tmp/output-"
+    assert agent._executor._bash_output_file_prefix == "/tmp/output-"
     assert "/tmp/notes.md" in Proximus.handoff_message(agent, "summary", "notes")
     after = fake.calls[2]["messages"]
     assert any(m.get("content") == "[handoff] summary" for m in after)

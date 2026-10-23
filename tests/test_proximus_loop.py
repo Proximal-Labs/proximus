@@ -18,12 +18,12 @@ from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import AgentConfig
 
 from harbor_proximus import Proximus
+from harbor_proximus.config import PROGRESS_FILE
 from harbor_proximus.llm import LLM
 from harbor_proximus.prompts import (
     CONTINUE_MESSAGE,
     EMPTY_RESPONSE_MESSAGE,
     OUTPUT_LENGTH_MESSAGE,
-    PROGRESS_FILE,
     SUBMIT_GUIDANCE,
     TASK_TIMER_GUIDANCE,
     fmt_duration,

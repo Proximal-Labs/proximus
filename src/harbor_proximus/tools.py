@@ -12,7 +12,7 @@ from harbor.environments.base import BaseEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 import harbor_proximus.images as images
-from harbor_proximus.config import BUDGET_MARGIN_SEC
+from harbor_proximus.config import BASH_OUTPUT_FILE_PREFIX, BUDGET_MARGIN_SEC
 
 
 class EnvironmentGoneError(RuntimeError):
@@ -75,7 +75,6 @@ def raise_if_environment_gone(error: Exception) -> None:
 DEFAULT_TIMEOUT_SEC = 600
 MAX_TIMEOUT_SEC = 1800
 OUTPUT_LIMIT_CHARS = 30_000
-OUTPUT_PREFIX = "/tmp/proximus-output-"
 
 # Non-interactive defaults applied to every bash exec
 EXEC_ENV: dict[str, str] = {
@@ -284,14 +283,14 @@ class ToolExecutor:
         *,
         default_workdir: str | None = None,
         remaining_sec: Callable[[], float | None] | None = None,
-        output_prefix: str = OUTPUT_PREFIX,
+        bash_output_file_prefix: str = BASH_OUTPUT_FILE_PREFIX,
     ):
         self._environment = environment
         # Caps command timeouts so a foreground command can't outlive the
         # time budget — the loop must regain control before the hard kill.
         self._remaining_sec = remaining_sec
         self._default_workdir = default_workdir
-        self._output_prefix = output_prefix
+        self._bash_output_file_prefix = bash_output_file_prefix
 
     async def bash(self, args: BashArgs) -> ToolResult:
         if args.timeout_sec > MAX_TIMEOUT_SEC:
@@ -366,7 +365,7 @@ class ToolExecutor:
             for stream, text in (("stdout", stdout), ("stderr", stderr)):
                 # Independent names: the first upload must not reveal a future
                 # root-upload target in an agent-writable directory.
-                remote = f"{self._output_prefix}{uuid4().hex}.{stream}"
+                remote = f"{self._bash_output_file_prefix}{uuid4().hex}.{stream}"
                 try:
                     local = Path(tmp_dir) / stream
                     local.write_text(text or "", encoding="utf-8", newline="")

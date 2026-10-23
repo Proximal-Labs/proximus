@@ -45,7 +45,7 @@ async def check(model: str, args: argparse.Namespace) -> bool:
     llm.session_id = "proximus-smoke"
     schema = [tools.Tool("bash", tools.BASH_DESCRIPTION, tools.BashArgs, None).schema()]
     messages = [
-        {"role": "system", "content": prompts.system_prompt(False)},
+        {"role": "system", "content": prompts.system_prompt(ProximusConfig())},
         {"role": "user", "content": TASK},
     ]
     first = await llm.query(messages, schema)

@@ -10,6 +10,9 @@ from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_val
 # this long, so the run can still finish cleanly.
 BUDGET_MARGIN_SEC = 120
 
+PROGRESS_FILE = "/tmp/proximus/PROGRESS.md"
+BASH_OUTPUT_FILE_PREFIX = "/tmp/proximus-output-"
+
 
 class ProximusConfig(AgentOptions):
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
@@ -106,6 +109,14 @@ class ProximusConfig(AgentOptions):
     prompt_template_path: str | None = None
     """Jinja2 template around the task instruction. It must contain
     ``{{ instruction }}``."""
+
+    progress_file: str = PROGRESS_FILE
+    """The model's durable notes file in the sandbox. The system prompt and the
+    compaction message name it, and each compaction re-reads it."""
+
+    bash_output_file_prefix: str = BASH_OUTPUT_FILE_PREFIX
+    """Start of the sandbox paths where ``bash`` saves the full output of a
+    command that is too long to show."""
 
     temperature: float | None = None
     """Sampling temperature. Omit to use the provider's default."""

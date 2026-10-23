@@ -66,8 +66,6 @@ class Proximus(BaseAgent):
 
     capabilities = AgentCapabilities(atif=True)
     options_model = ProximusConfig
-    progress_file = prompts.PROGRESS_FILE
-    output_prefix = tools.OUTPUT_PREFIX
 
     _environment: BaseEnvironment
     _executor: tools.ToolExecutor
@@ -181,7 +179,7 @@ class Proximus(BaseAgent):
             environment,
             default_workdir=workdir,
             remaining_sec=self._remaining_budget_sec,
-            output_prefix=self.output_prefix,
+            bash_output_file_prefix=self.config.bash_output_file_prefix,
         )
         if self.config.submission_mode == "git":
             await self._init_submissions(environment, workdir)
@@ -484,11 +482,7 @@ class Proximus(BaseAgent):
     # the way Harbor agents are customized.
 
     def system_prompt(self) -> str:
-        return prompts.system_prompt(
-            self.config.task_provides_timer,
-            self.config.submission_mode,
-            self.progress_file,
-        )
+        return prompts.system_prompt(self.config)
 
     def initial_message(
         self, instruction: str, workdir: str, environment: BaseEnvironment
@@ -512,9 +506,7 @@ class Proximus(BaseAgent):
             summary,
             progress,
             self._elapsed(),
-            self.config.time_budget_sec,
-            self.config.submission_mode,
-            self.progress_file,
+            self.config,
         )
 
     def build_tools(self) -> dict[str, tools.Tool]:
@@ -714,7 +706,7 @@ class Proximus(BaseAgent):
         needs its latest state, not its opening plan."""
         try:
             result = await self._environment.exec(
-                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} {self.progress_file} 2>/dev/null",
+                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} {self.config.progress_file} 2>/dev/null",
                 timeout_sec=30,
             )
         except Exception as e:
@@ -765,12 +757,11 @@ class Proximus(BaseAgent):
     async def _ensure_progress_dir(self, environment: BaseEnvironment) -> None:
         """Pre-create the durable-notes directory so the model's first
         append to PROGRESS.md cannot fail on a missing parent."""
+        parent = PurePosixPath(self.config.progress_file).parent
         try:
-            await environment.exec(
-                f"mkdir -p {self.progress_file.parent}", timeout_sec=30
-            )
+            await environment.exec(f"mkdir -p {parent}", timeout_sec=30)
         except Exception as e:  # noqa: BLE001 - backends raise varied types
-            self.logger.debug(f"Could not pre-create {self.progress_file.parent}: {e}")
+            self.logger.debug(f"Could not pre-create {parent}: {e}")
 
     async def _init_submissions(
         self, environment: BaseEnvironment, workdir: str
