@@ -12,7 +12,7 @@ from harbor.environments.base import BaseEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 import harbor_proximus.images as images
-from harbor_proximus.config import BUDGET_MARGIN_SEC
+from harbor_proximus.config import BASH_OUTPUT_FILE_PREFIX, BUDGET_MARGIN_SEC
 
 
 class EnvironmentGoneError(RuntimeError):
@@ -283,12 +283,14 @@ class ToolExecutor:
         *,
         default_workdir: str | None = None,
         remaining_sec: Callable[[], float | None] | None = None,
+        bash_output_file_prefix: str = BASH_OUTPUT_FILE_PREFIX,
     ):
         self._environment = environment
         # Caps command timeouts so a foreground command can't outlive the
         # time budget — the loop must regain control before the hard kill.
         self._remaining_sec = remaining_sec
         self._default_workdir = default_workdir
+        self._bash_output_file_prefix = bash_output_file_prefix
 
     async def bash(self, args: BashArgs) -> ToolResult:
         if args.timeout_sec > MAX_TIMEOUT_SEC:
@@ -363,7 +365,7 @@ class ToolExecutor:
             for stream, text in (("stdout", stdout), ("stderr", stderr)):
                 # Independent names: the first upload must not reveal a future
                 # root-upload target in an agent-writable directory.
-                remote = f"/tmp/proximus-output-{uuid4().hex}.{stream}"
+                remote = f"{self._bash_output_file_prefix}{uuid4().hex}.{stream}"
                 try:
                     local = Path(tmp_dir) / stream
                     local.write_text(text or "", encoding="utf-8", newline="")

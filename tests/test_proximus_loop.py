@@ -18,12 +18,12 @@ from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import AgentConfig
 
 from harbor_proximus import Proximus
+from harbor_proximus.config import PROGRESS_FILE
 from harbor_proximus.llm import LLM
 from harbor_proximus.prompts import (
     CONTINUE_MESSAGE,
     EMPTY_RESPONSE_MESSAGE,
     OUTPUT_LENGTH_MESSAGE,
-    PROGRESS_FILE,
     SUBMIT_GUIDANCE,
     TASK_TIMER_GUIDANCE,
     fmt_duration,
@@ -874,7 +874,7 @@ def test_system_prompt_teaches_commit_then_submit_and_renders_placeholders(tmp_p
     assert "confirm" not in agent._system_prompt
     assert "record it with `submit`" in agent._system_prompt
     assert "record it with `submit`" in agent._system_prompt
-    assert str(PROGRESS_FILE) in agent._system_prompt
+    assert PROGRESS_FILE in agent._system_prompt
     assert "{{SUBMIT_GUIDANCE}}" not in agent._system_prompt
     assert "{{TIMER_GUIDANCE}}" not in agent._system_prompt
     assert "{{PROGRESS_FILE}}" not in agent._system_prompt

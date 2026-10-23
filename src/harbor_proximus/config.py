@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
 from harbor.agents.options import AgentOptions
@@ -9,6 +9,9 @@ from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_val
 # long before the budget runs out, and a model request always gets at least
 # this long, so the run can still finish cleanly.
 BUDGET_MARGIN_SEC = 120
+
+PROGRESS_FILE = "/tmp/proximus/PROGRESS.md"
+BASH_OUTPUT_FILE_PREFIX = "/tmp/proximus-output-"
 
 
 class ProximusConfig(AgentOptions):
@@ -107,6 +110,14 @@ class ProximusConfig(AgentOptions):
     """Jinja2 template around the task instruction. It must contain
     ``{{ instruction }}``."""
 
+    progress_file: str = PROGRESS_FILE
+    """The model's durable notes file in the sandbox. The system prompt and the
+    compaction message name it, and each compaction re-reads it."""
+
+    bash_output_file_prefix: str = BASH_OUTPUT_FILE_PREFIX
+    """Start of the sandbox paths where ``bash`` saves the full output of a
+    command that is too long to show."""
+
     temperature: float | None = None
     """Sampling temperature. Omit to use the provider's default."""
 
@@ -130,6 +141,15 @@ class ProximusConfig(AgentOptions):
                 raise ValueError(f"prompt_template_path not found: {value}")
             # Raises unless the template uses {{ instruction }}.
             render_prompt_template(Path(value), "instruction")
+        return value
+
+    @field_validator("progress_file", "bash_output_file_prefix")
+    @classmethod
+    def _absolute_sandbox_path(cls, value: str) -> str:
+        # A relative path would resolve against different working directories
+        # for the harness's commands and the model's.
+        if not PurePosixPath(value).is_absolute():
+            raise ValueError(f"must be an absolute sandbox path: {value}")
         return value
 
     @model_validator(mode="after")

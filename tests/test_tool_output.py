@@ -195,3 +195,11 @@ def test_description_explains_sequential_calls_background_work_and_timeout():
         "does not guarantee the process was killed",
     ):
         assert phrase in BASH_DESCRIPTION
+
+
+async def test_bash_output_file_prefix_can_be_set():
+    env = OutputEnv("x" * 40_000)
+    await make_executor(env, bash_output_file_prefix="/tmp/output-").bash(
+        BashArgs(command="produce")
+    )
+    assert len(env.files) == 2 and all(p.startswith("/tmp/output-") for p in env.files)

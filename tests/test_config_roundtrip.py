@@ -81,6 +81,8 @@ FIELD_VALUES: dict[str, Any] = {
     "compaction_threshold": 0.5,
     "disallowed_tools": ["list_submissions"],
     "prompt_template_path": "prompt.j2",
+    "progress_file": "/tmp/notes.md",
+    "bash_output_file_prefix": "/tmp/output-",
     "temperature": 0.3,
     "api_base": "http://127.0.0.1:9/v1",
     "max_thinking_tokens": 2048,

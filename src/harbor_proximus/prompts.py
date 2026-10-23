@@ -1,11 +1,11 @@
 """Every model-facing string Proximus injects"""
 
-from pathlib import Path
 from typing import Any
 
 from harbor.models.task.config import NetworkMode
 
 from harbor_proximus import utils
+from harbor_proximus.config import ProximusConfig
 from harbor_proximus.timer import DEADLINE_PATH
 
 SUMMARY_REQUEST = """Pause the task. Produce a comprehensive handoff summary of your work so far for another agent who will continue without your conversation history. Cover:
@@ -20,12 +20,6 @@ Be specific and factual. Do not call any tools."""
 HANDOFF_HEADER = (
     "[Context compacted] Your earlier conversation history was summarized to "
     "free context space."
-)
-PROGRESS_FILE = Path("/tmp/proximus/PROGRESS.md")
-HANDOFF_FOOTER = (
-    f"Before acting: read {PROGRESS_FILE} and inspect the current "
-    "state of the filesystem (e.g. `git log`, recently modified files). Do "
-    "not redo completed work. Continue the task."
 )
 
 SUBMIT_TIME_LEFT = (
@@ -48,10 +42,6 @@ DONE_GUIDANCE = (
     "you feel you cannot progress further with the resources left."
 )
 DONE_MESSAGE = "Done. Ending the session."
-HANDOFF_FOOTER_NO_GIT = (
-    f"Before acting: read {PROGRESS_FILE} and inspect the current files. "
-    "Do not redo completed work. Continue the work."
-)
 
 SUBMIT_FALLBACK = (
     "The final workspace state at the end of the run will be used as your "
@@ -131,19 +121,19 @@ def empty_response_message(submission_mode: str = "git") -> str:
     return EMPTY_RESPONSE_MESSAGE
 
 
-def system_prompt(
-    task_provides_timer: bool = False, submission_mode: str = "git"
-) -> str:
+def system_prompt(config: ProximusConfig) -> str:
     """Render the system template with submit, timer, and durable-notes
     guidance."""
     template = utils.read_template("system.md")
-    timer_line = TASK_TIMER_GUIDANCE if task_provides_timer else DEADLINE_GUIDANCE
-    completion = DONE_GUIDANCE if submission_mode == "none" else SUBMIT_GUIDANCE
+    timer_line = (
+        TASK_TIMER_GUIDANCE if config.task_provides_timer else DEADLINE_GUIDANCE
+    )
+    completion = DONE_GUIDANCE if config.submission_mode == "none" else SUBMIT_GUIDANCE
     return (
         template.replace("{{SUBMIT_GUIDANCE}}", completion)
         .replace("{{TIMER_GUIDANCE}}", timer_line)
         .replace("{{ARTIFACT_GUIDANCE}}", "")
-        .replace("{{PROGRESS_FILE}}", str(PROGRESS_FILE))
+        .replace("{{PROGRESS_FILE}}", config.progress_file)
     )
 
 
@@ -187,29 +177,43 @@ def _network_note(mode: NetworkMode) -> str | None:
     return None
 
 
+def handoff_footer(config: ProximusConfig) -> str:
+    """The closing instruction of the compaction message."""
+    if config.submission_mode == "none":
+        return (
+            f"Before acting: read {config.progress_file} and inspect the current "
+            "files. Do not redo completed work. Continue the work."
+        )
+    return (
+        f"Before acting: read {config.progress_file} and inspect the current "
+        "state of the filesystem (e.g. `git log`, recently modified files). Do "
+        "not redo completed work. Continue the task."
+    )
+
+
 def handoff_message(
     instruction: str,
     summary: str | None,
     progress: str | None,
     elapsed: float,
-    budget: float | None,
-    submission_mode: str = "git",
+    config: ProximusConfig,
 ) -> str:
     """The compaction boundary message: header, original instruction, model
     summary, durable notes, remaining budget, footer."""
+    budget = config.time_budget_sec
     parts = [
         HANDOFF_HEADER,
         f"Original task instruction:\n\n{instruction}",
         "Handoff summary of the work completed so far:\n\n"
         + (
             summary
-            or f"(summary unavailable — rely on {PROGRESS_FILE} "
+            or f"(summary unavailable — rely on {config.progress_file} "
             "and the state of the filesystem)"
         ),
     ]
     if progress:
         parts.append(
-            f"Your durable notes, re-read from {PROGRESS_FILE} at the "
+            f"Your durable notes, re-read from {config.progress_file} at the "
             f"compaction boundary:\n\n{progress}"
         )
     if budget:
@@ -219,7 +223,7 @@ def handoff_message(
             f"{fmt_duration(budget)} remain "
             f"({round(100 * remaining / budget)}% left)."
         )
-    parts.append(HANDOFF_FOOTER_NO_GIT if submission_mode == "none" else HANDOFF_FOOTER)
+    parts.append(handoff_footer(config))
     return "\n\n".join(parts)
 
 

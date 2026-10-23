@@ -2,6 +2,7 @@ import contextlib
 import itertools
 import json
 import logging
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -179,6 +180,7 @@ class Proximus(BaseAgent):
             environment,
             default_workdir=workdir,
             remaining_sec=self._remaining_budget_sec,
+            bash_output_file_prefix=self.config.bash_output_file_prefix,
         )
         if self.config.submission_mode == "git":
             await self._init_submissions(environment, workdir)
@@ -481,9 +483,7 @@ class Proximus(BaseAgent):
     # the way Harbor agents are customized.
 
     def system_prompt(self) -> str:
-        return prompts.system_prompt(
-            self.config.task_provides_timer, self.config.submission_mode
-        )
+        return prompts.system_prompt(self.config)
 
     def initial_message(
         self, instruction: str, workdir: str, environment: BaseEnvironment
@@ -499,6 +499,16 @@ class Proximus(BaseAgent):
     def summary_request(self) -> str:
         """The request for a handoff summary when the conversation is compacted."""
         return prompts.SUMMARY_REQUEST
+
+    def handoff_message(self, summary: str | None, progress: str | None) -> str:
+        """The message that replaces the older history when the conversation is compacted."""
+        return prompts.handoff_message(
+            self._instruction,
+            summary,
+            progress,
+            self._elapsed(),
+            self.config,
+        )
 
     def build_tools(self) -> dict[str, tools.Tool]:
         """The model's tools, keyed by name. Called once, at construction;
@@ -648,14 +658,7 @@ class Proximus(BaseAgent):
         tail verbatim (minus any tool results the cut stranded)."""
         summary = await self._handoff_summary()
         progress = await self._read_progress()
-        handoff = prompts.handoff_message(
-            self._instruction,
-            summary,
-            progress,
-            self._elapsed(),
-            self.config.time_budget_sec,
-            self.config.submission_mode,
-        )
+        handoff = self.handoff_message(summary, progress)
 
         messages = self._run.messages
         tail = messages[max(2, len(messages) - KEEP_RECENT_MESSAGES) :]
@@ -704,7 +707,8 @@ class Proximus(BaseAgent):
         needs its latest state, not its opening plan."""
         try:
             result = await self._environment.exec(
-                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} {prompts.PROGRESS_FILE} 2>/dev/null",
+                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} "
+                f"{shlex.quote(self.config.progress_file)} 2>/dev/null",
                 timeout_sec=30,
             )
         except Exception as e:
@@ -755,14 +759,13 @@ class Proximus(BaseAgent):
     async def _ensure_progress_dir(self, environment: BaseEnvironment) -> None:
         """Pre-create the durable-notes directory so the model's first
         append to PROGRESS.md cannot fail on a missing parent."""
+        parent = PurePosixPath(self.config.progress_file).parent
         try:
             await environment.exec(
-                f"mkdir -p {prompts.PROGRESS_FILE.parent}", timeout_sec=30
+                f"mkdir -p {shlex.quote(str(parent))}", timeout_sec=30
             )
         except Exception as e:  # noqa: BLE001 - backends raise varied types
-            self.logger.debug(
-                f"Could not pre-create {prompts.PROGRESS_FILE.parent}: {e}"
-            )
+            self.logger.debug(f"Could not pre-create {parent}: {e}")
 
     async def _init_submissions(
         self, environment: BaseEnvironment, workdir: str
