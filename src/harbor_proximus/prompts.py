@@ -21,11 +21,6 @@ HANDOFF_HEADER = (
     "[Context compacted] Your earlier conversation history was summarized to "
     "free context space."
 )
-HANDOFF_FOOTER = (
-    "Before acting: read {progress_file} and inspect the current "
-    "state of the filesystem (e.g. `git log`, recently modified files). Do "
-    "not redo completed work. Continue the task."
-)
 
 SUBMIT_TIME_LEFT = (
     "{remaining} of your {budget} time budget remains ({percent_left}% left)."
@@ -47,10 +42,6 @@ DONE_GUIDANCE = (
     "you feel you cannot progress further with the resources left."
 )
 DONE_MESSAGE = "Done. Ending the session."
-HANDOFF_FOOTER_NO_GIT = (
-    "Before acting: read {progress_file} and inspect the current files. "
-    "Do not redo completed work. Continue the work."
-)
 
 SUBMIT_FALLBACK = (
     "The final workspace state at the end of the run will be used as your "
@@ -186,6 +177,20 @@ def _network_note(mode: NetworkMode) -> str | None:
     return None
 
 
+def handoff_footer(config: ProximusConfig) -> str:
+    """The closing instruction of the compaction message."""
+    if config.submission_mode == "none":
+        return (
+            f"Before acting: read {config.progress_file} and inspect the current "
+            "files. Do not redo completed work. Continue the work."
+        )
+    return (
+        f"Before acting: read {config.progress_file} and inspect the current "
+        "state of the filesystem (e.g. `git log`, recently modified files). Do "
+        "not redo completed work. Continue the task."
+    )
+
+
 def handoff_message(
     instruction: str,
     summary: str | None,
@@ -218,10 +223,7 @@ def handoff_message(
             f"{fmt_duration(budget)} remain "
             f"({round(100 * remaining / budget)}% left)."
         )
-    footer = (
-        HANDOFF_FOOTER_NO_GIT if config.submission_mode == "none" else HANDOFF_FOOTER
-    )
-    parts.append(footer.format(progress_file=config.progress_file))
+    parts.append(handoff_footer(config))
     return "\n\n".join(parts)
 
 

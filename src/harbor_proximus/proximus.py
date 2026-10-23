@@ -2,6 +2,7 @@ import contextlib
 import itertools
 import json
 import logging
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -706,7 +707,8 @@ class Proximus(BaseAgent):
         needs its latest state, not its opening plan."""
         try:
             result = await self._environment.exec(
-                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} {self.config.progress_file} 2>/dev/null",
+                f"tail -c {PROGRESS_REINJECT_MAX_BYTES} "
+                f"{shlex.quote(self.config.progress_file)} 2>/dev/null",
                 timeout_sec=30,
             )
         except Exception as e:
@@ -759,7 +761,9 @@ class Proximus(BaseAgent):
         append to PROGRESS.md cannot fail on a missing parent."""
         parent = PurePosixPath(self.config.progress_file).parent
         try:
-            await environment.exec(f"mkdir -p {parent}", timeout_sec=30)
+            await environment.exec(
+                f"mkdir -p {shlex.quote(str(parent))}", timeout_sec=30
+            )
         except Exception as e:  # noqa: BLE001 - backends raise varied types
             self.logger.debug(f"Could not pre-create {parent}: {e}")
 

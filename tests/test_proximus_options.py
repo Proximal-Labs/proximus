@@ -189,3 +189,9 @@ async def test_sandbox_paths_and_handoff_hook(tmp_path, monkeypatch):
     assert "/tmp/notes.md" in Proximus.handoff_message(agent, "summary", "notes")
     after = fake.calls[2]["messages"]
     assert any(m.get("content") == "[handoff] summary" for m in after)
+
+
+def test_sandbox_paths_must_be_absolute(tmp_path):
+    for option in ("progress_file", "bash_output_file_prefix"):
+        with pytest.raises(ValueError, match="absolute sandbox path"):
+            make_agent(tmp_path, **{option: "notes.md"})

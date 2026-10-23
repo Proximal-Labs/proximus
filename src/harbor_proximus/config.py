@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
 from harbor.agents.options import AgentOptions
@@ -141,6 +141,15 @@ class ProximusConfig(AgentOptions):
                 raise ValueError(f"prompt_template_path not found: {value}")
             # Raises unless the template uses {{ instruction }}.
             render_prompt_template(Path(value), "instruction")
+        return value
+
+    @field_validator("progress_file", "bash_output_file_prefix")
+    @classmethod
+    def _absolute_sandbox_path(cls, value: str) -> str:
+        # A relative path would resolve against different working directories
+        # for the harness's commands and the model's.
+        if not PurePosixPath(value).is_absolute():
+            raise ValueError(f"must be an absolute sandbox path: {value}")
         return value
 
     @model_validator(mode="after")

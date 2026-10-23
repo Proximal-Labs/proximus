@@ -874,7 +874,7 @@ def test_system_prompt_teaches_commit_then_submit_and_renders_placeholders(tmp_p
     assert "confirm" not in agent._system_prompt
     assert "record it with `submit`" in agent._system_prompt
     assert "record it with `submit`" in agent._system_prompt
-    assert str(PROGRESS_FILE) in agent._system_prompt
+    assert PROGRESS_FILE in agent._system_prompt
     assert "{{SUBMIT_GUIDANCE}}" not in agent._system_prompt
     assert "{{TIMER_GUIDANCE}}" not in agent._system_prompt
     assert "{{PROGRESS_FILE}}" not in agent._system_prompt
