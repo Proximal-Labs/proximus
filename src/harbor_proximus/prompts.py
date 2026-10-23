@@ -23,7 +23,7 @@ HANDOFF_HEADER = (
 )
 PROGRESS_FILE = Path("/tmp/proximus/PROGRESS.md")
 HANDOFF_FOOTER = (
-    f"Before acting: read {PROGRESS_FILE} and inspect the current "
+    "Before acting: read {progress_file} and inspect the current "
     "state of the filesystem (e.g. `git log`, recently modified files). Do "
     "not redo completed work. Continue the task."
 )
@@ -49,7 +49,7 @@ DONE_GUIDANCE = (
 )
 DONE_MESSAGE = "Done. Ending the session."
 HANDOFF_FOOTER_NO_GIT = (
-    f"Before acting: read {PROGRESS_FILE} and inspect the current files. "
+    "Before acting: read {progress_file} and inspect the current files. "
     "Do not redo completed work. Continue the work."
 )
 
@@ -132,7 +132,9 @@ def empty_response_message(submission_mode: str = "git") -> str:
 
 
 def system_prompt(
-    task_provides_timer: bool = False, submission_mode: str = "git"
+    task_provides_timer: bool = False,
+    submission_mode: str = "git",
+    progress_file: Path = PROGRESS_FILE,
 ) -> str:
     """Render the system template with submit, timer, and durable-notes
     guidance."""
@@ -143,7 +145,7 @@ def system_prompt(
         template.replace("{{SUBMIT_GUIDANCE}}", completion)
         .replace("{{TIMER_GUIDANCE}}", timer_line)
         .replace("{{ARTIFACT_GUIDANCE}}", "")
-        .replace("{{PROGRESS_FILE}}", str(PROGRESS_FILE))
+        .replace("{{PROGRESS_FILE}}", str(progress_file))
     )
 
 
@@ -194,6 +196,7 @@ def handoff_message(
     elapsed: float,
     budget: float | None,
     submission_mode: str = "git",
+    progress_file: Path = PROGRESS_FILE,
 ) -> str:
     """The compaction boundary message: header, original instruction, model
     summary, durable notes, remaining budget, footer."""
@@ -203,13 +206,13 @@ def handoff_message(
         "Handoff summary of the work completed so far:\n\n"
         + (
             summary
-            or f"(summary unavailable — rely on {PROGRESS_FILE} "
+            or f"(summary unavailable — rely on {progress_file} "
             "and the state of the filesystem)"
         ),
     ]
     if progress:
         parts.append(
-            f"Your durable notes, re-read from {PROGRESS_FILE} at the "
+            f"Your durable notes, re-read from {progress_file} at the "
             f"compaction boundary:\n\n{progress}"
         )
     if budget:
@@ -219,7 +222,8 @@ def handoff_message(
             f"{fmt_duration(budget)} remain "
             f"({round(100 * remaining / budget)}% left)."
         )
-    parts.append(HANDOFF_FOOTER_NO_GIT if submission_mode == "none" else HANDOFF_FOOTER)
+    footer = HANDOFF_FOOTER_NO_GIT if submission_mode == "none" else HANDOFF_FOOTER
+    parts.append(footer.format(progress_file=progress_file))
     return "\n\n".join(parts)
 
 
