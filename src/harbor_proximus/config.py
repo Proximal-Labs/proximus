@@ -54,6 +54,17 @@ class ProximusConfig(AgentOptions):
     different keys. Read from Harbor's agent env first, then the host. Without
     it, the provider's usual variable is used."""
 
+    anthropic_workload_identity: bool = False
+    """Authenticate an ``anthropic/`` model with Workload Identity Federation
+    instead of an API key. The host's AWS role mints an STS identity token,
+    and Anthropic exchanges it for a short-lived access token, which is
+    renewed before it expires. The IDs come from
+    ``ANTHROPIC_FEDERATION_RULE_ID`` and ``ANTHROPIC_ORGANIZATION_ID``, plus
+    ``ANTHROPIC_SERVICE_ACCOUNT_ID`` and ``ANTHROPIC_WORKSPACE_ID`` when the
+    federation rule needs them (Harbor's agent env first, then the host). STS
+    uses the AWS default region (``AWS_DEFAULT_REGION``, ``~/.aws/config``,
+    else ``AWS_REGION``). No API key is used in this mode."""
+
     workspace_git_excludes: list[str] = Field(default_factory=list)
     """Paths that submissions never commit, in ``.gitignore`` syntax (for
     example caches and checkpoints that grading ignores anyway). Written to
@@ -121,5 +132,13 @@ class ProximusConfig(AgentOptions):
             raise ValueError(
                 "set either max_thinking_tokens or reasoning_effort, not both: "
                 "LiteLLM maps both onto the provider's thinking setting"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _one_credential(self) -> Self:
+        if self.anthropic_workload_identity and self.api_key_env is not None:
+            raise ValueError(
+                "set either api_key_env or anthropic_workload_identity, not both"
             )
         return self

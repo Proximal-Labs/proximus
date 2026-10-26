@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-10-14T23:51:31.91401876Z"
+exclude-newer = "2026-10-19T16:58:35.016062Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -806,6 +806,7 @@ name = "harbor-proximus"
 version = "0.1.0a1"
 source = { editable = "." }
 dependencies = [
+    { name = "boto3" },
     { name = "harbor" },
     { name = "litellm" },
     { name = "pillow" },
@@ -825,6 +826,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", specifier = ">=1.41" },
     { name = "harbor", specifier = "==0.23.0" },
     { name = "litellm", specifier = ">=1.97.0,<2" },
     { name = "pillow", specifier = ">=10" },

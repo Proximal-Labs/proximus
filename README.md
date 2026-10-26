@@ -52,6 +52,15 @@ sandbox, so the model cannot read them; Bedrock, SageMaker and Vertex keep
 LiteLLM's own lookup. Never put keys in `--ak` or `llm_call_kwargs`: Harbor saves
 agent options verbatim in job files.
 
+Anthropic models can use [Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/wif-providers/aws)
+instead of an API key: set `anthropic_workload_identity=true` and provide
+`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and, when the
+federation rule needs them, `ANTHROPIC_SERVICE_ACCOUNT_ID` and
+`ANTHROPIC_WORKSPACE_ID` (agent env, then shell). The host's AWS role mints a
+new STS identity token for each exchange (boto3 uses its default region), and
+Proximus renews the short-lived access token two minutes before it expires. No
+API key is read or sent in this mode.
+
 ## Options and customization
 
 Options follow Harbor's Terminus 2 names where they exist: `max_turns`,

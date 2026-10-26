@@ -58,10 +58,10 @@ def write_task(task_dir: Path, table: dict[str, Any], header: str = "") -> Path:
     return task_dir
 
 
-def make_agent(kwargs: dict[str, Any], logs_dir: Path):
+def make_agent(kwargs: dict[str, Any], logs_dir: Path, model: str = MODEL):
     return AgentFactory.create_agent_from_config(
         AgentConfig(
-            import_path="harbor_proximus:Proximus", model_name=MODEL, kwargs=kwargs
+            import_path="harbor_proximus:Proximus", model_name=model, kwargs=kwargs
         ),
         logs_dir=logs_dir,
     )
@@ -78,6 +78,7 @@ FIELD_VALUES: dict[str, Any] = {
     "task_provides_timer": True,
     "reasoning_effort": "high",
     "api_key_env": "PROXIMUS_TIER0_KEY",
+    "anthropic_workload_identity": True,
     "workspace_git_excludes": ["node_modules", "target"],
     "litellm_model_info": {
         MODEL: {"max_input_tokens": 50000, "supports_vision": True},
@@ -117,13 +118,19 @@ def test_every_field_round_trips_through_task_toml_and_factory(
         expected = str((task_dir / value).resolve())
     if field == "api_key_env":
         monkeypatch.setenv(value, "roundtrip-key")
+    model = MODEL
+    if field == "anthropic_workload_identity":
+        model = "anthropic/claude-test"
+        monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_test")
+        monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "org-test")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
 
-    kwargs = task_agent_kwargs(write_task(task_dir, {field: value}), MODEL)
+    kwargs = task_agent_kwargs(write_task(task_dir, {field: value}), model)
     assert kwargs[field] == expected
     # No [agent].timeout_sec and no /app artifact: nothing else is defaulted.
     assert set(kwargs) == {field}
 
-    agent = make_agent(kwargs, tmp_path / "logs")
+    agent = make_agent(kwargs, tmp_path / "logs", model)
     assert getattr(agent.config, field) == expected
 
     if field == "disallowed_tools":
@@ -136,6 +143,9 @@ def test_every_field_round_trips_through_task_toml_and_factory(
         assert "view_image" in agent._tools
     if field == "api_key_env":
         assert agent._llm._api_key == "roundtrip-key"
+    if field == "anthropic_workload_identity":
+        assert agent._llm._api_key is None
+        assert agent._llm._access_tokens is not None
 
 
 def test_all_fields_together(tmp_path, monkeypatch):
@@ -143,8 +153,10 @@ def test_all_fields_together(tmp_path, monkeypatch):
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     (task_dir / "prompt.j2").write_text("{{ instruction }}")
-    # max_thinking_tokens and reasoning_effort are mutually exclusive.
-    values = {k: v for k, v in FIELD_VALUES.items() if k != "max_thinking_tokens"}
+    # max_thinking_tokens and reasoning_effort are mutually exclusive, and so
+    # are api_key_env and anthropic_workload_identity.
+    excluded = {"max_thinking_tokens", "anthropic_workload_identity"}
+    values = {k: v for k, v in FIELD_VALUES.items() if k not in excluded}
     kwargs = task_agent_kwargs(write_task(task_dir, values), MODEL)
     agent = make_agent(kwargs, tmp_path / "logs")
     for field, value in values.items():
@@ -174,6 +186,10 @@ def test_all_fields_together(tmp_path, monkeypatch):
         ),
         pytest.param(
             "[agent.proximus]\nmax_thinking_tokens = 512\n", id="thinking-lt-1024"
+        ),
+        pytest.param(
+            '[agent.proximus]\nanthropic_workload_identity = true\napi_key_env = "K"\n',
+            id="workload-identity-and-api-key-env",
         ),
         pytest.param('[agent.proximus]\nmodels = "x"\n', id="models-string"),
         pytest.param("[agent.proximus]\nmodels = [1]\n", id="models-array"),
