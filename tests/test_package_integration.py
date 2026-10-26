@@ -247,7 +247,7 @@ def test_model_info_keeps_known_bare_names(tmp_path):
 
 
 def test_resolve_credentials_unit():
-    from harbor_proximus.llm import resolve_credentials
+    from harbor_proximus.auth import resolve_credentials
 
     env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "https://gw"}
     plain = resolve_credentials("openai/m", None, env)

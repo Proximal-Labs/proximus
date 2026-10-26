@@ -5,6 +5,8 @@ from harbor.agents.options import AgentOptions
 from harbor.utils.templating import render_prompt_template
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from harbor_proximus.auth.loader import loader_class
+
 # Seconds kept free at the end of the time budget: bash commands time out this
 # long before the budget runs out, and a model request always gets at least
 # this long, so the run can still finish cleanly.
@@ -54,16 +56,13 @@ class ProximusConfig(AgentOptions):
     different keys. Read from Harbor's agent env first, then the host. Without
     it, the provider's usual variable is used."""
 
-    anthropic_workload_identity: bool = False
-    """Authenticate an ``anthropic/`` model with Workload Identity Federation
-    instead of an API key. The host's AWS role mints an STS identity token,
-    and Anthropic exchanges it for a short-lived access token, which is
-    renewed before it expires. The IDs come from
-    ``ANTHROPIC_FEDERATION_RULE_ID`` and ``ANTHROPIC_ORGANIZATION_ID``, plus
-    ``ANTHROPIC_SERVICE_ACCOUNT_ID`` and ``ANTHROPIC_WORKSPACE_ID`` when the
-    federation rule needs them (Harbor's agent env first, then the host). STS
-    uses the AWS default region (``AWS_DEFAULT_REGION``, ``~/.aws/config``,
-    else ``AWS_REGION``). No API key is used in this mode."""
+    api_key_loader: str | None = None
+    """Load this model's API key for each request instead of reading a fixed
+    one, for credentials that expire. ``anthropic_wif`` is built in: Anthropic
+    Workload Identity Federation from the host's AWS role (settings in
+    ``harbor_proximus.auth.anthropic_wif``). Any other value is a
+    ``module:Class`` path to an ``ApiKeyLoader`` subclass. Loaders read their
+    settings from Harbor's agent env first, then the host."""
 
     workspace_git_excludes: list[str] = Field(default_factory=list)
     """Paths that submissions never commit, in ``.gitignore`` syntax (for
@@ -116,6 +115,13 @@ class ProximusConfig(AgentOptions):
     Set ``max_input_tokens`` to a positive integer if the registry has no valid
     input limit. This is the only field used for the context limit."""
 
+    @field_validator("api_key_loader")
+    @classmethod
+    def _loader_exists(cls, value: str | None) -> str | None:
+        if value is not None:
+            loader_class(value)  # Raises unless it names an ApiKeyLoader.
+        return value
+
     @field_validator("prompt_template_path")
     @classmethod
     def _template_renders(cls, value: str | None) -> str | None:
@@ -136,9 +142,7 @@ class ProximusConfig(AgentOptions):
         return self
 
     @model_validator(mode="after")
-    def _one_credential(self) -> Self:
-        if self.anthropic_workload_identity and self.api_key_env is not None:
-            raise ValueError(
-                "set either api_key_env or anthropic_workload_identity, not both"
-            )
+    def _one_key_source(self) -> Self:
+        if self.api_key_env is not None and self.api_key_loader is not None:
+            raise ValueError("set either api_key_env or api_key_loader, not both")
         return self

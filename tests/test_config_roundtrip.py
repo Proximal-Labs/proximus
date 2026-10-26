@@ -78,7 +78,7 @@ FIELD_VALUES: dict[str, Any] = {
     "task_provides_timer": True,
     "reasoning_effort": "high",
     "api_key_env": "PROXIMUS_TIER0_KEY",
-    "anthropic_workload_identity": True,
+    "api_key_loader": "anthropic_wif",
     "workspace_git_excludes": ["node_modules", "target"],
     "litellm_model_info": {
         MODEL: {"max_input_tokens": 50000, "supports_vision": True},
@@ -119,7 +119,7 @@ def test_every_field_round_trips_through_task_toml_and_factory(
     if field == "api_key_env":
         monkeypatch.setenv(value, "roundtrip-key")
     model = MODEL
-    if field == "anthropic_workload_identity":
+    if field == "api_key_loader":
         model = "anthropic/claude-test"
         monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_test")
         monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "org-test")
@@ -143,9 +143,9 @@ def test_every_field_round_trips_through_task_toml_and_factory(
         assert "view_image" in agent._tools
     if field == "api_key_env":
         assert agent._llm._api_key == "roundtrip-key"
-    if field == "anthropic_workload_identity":
+    if field == "api_key_loader":
         assert agent._llm._api_key is None
-        assert agent._llm._access_tokens is not None
+        assert agent._llm._api_key_loader is not None
 
 
 def test_all_fields_together(tmp_path, monkeypatch):
@@ -154,8 +154,8 @@ def test_all_fields_together(tmp_path, monkeypatch):
     task_dir.mkdir()
     (task_dir / "prompt.j2").write_text("{{ instruction }}")
     # max_thinking_tokens and reasoning_effort are mutually exclusive, and so
-    # are api_key_env and anthropic_workload_identity.
-    excluded = {"max_thinking_tokens", "anthropic_workload_identity"}
+    # are api_key_env and api_key_loader.
+    excluded = {"max_thinking_tokens", "api_key_loader"}
     values = {k: v for k, v in FIELD_VALUES.items() if k not in excluded}
     kwargs = task_agent_kwargs(write_task(task_dir, values), MODEL)
     agent = make_agent(kwargs, tmp_path / "logs")
@@ -188,8 +188,11 @@ def test_all_fields_together(tmp_path, monkeypatch):
             "[agent.proximus]\nmax_thinking_tokens = 512\n", id="thinking-lt-1024"
         ),
         pytest.param(
-            '[agent.proximus]\nanthropic_workload_identity = true\napi_key_env = "K"\n',
-            id="workload-identity-and-api-key-env",
+            '[agent.proximus]\napi_key_loader = "anthropic_wif"\napi_key_env = "K"\n',
+            id="api-key-loader-and-api-key-env",
+        ),
+        pytest.param(
+            '[agent.proximus]\napi_key_loader = "vault"\n', id="unknown-api-key-loader"
         ),
         pytest.param('[agent.proximus]\nmodels = "x"\n', id="models-string"),
         pytest.param("[agent.proximus]\nmodels = [1]\n", id="models-array"),

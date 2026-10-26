@@ -3,7 +3,6 @@
 import copy
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -15,17 +14,16 @@ from typing import Any, cast, override
 
 import litellm
 import tenacity
-from harbor.agents.model_connection import (
-    PROVIDERS,
-    ModelConnectionSpec,
-    resolve_model_connection,
-)
 from harbor.llms.base import ContextLengthExceededError, OutputLengthExceededError
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
 from litellm.types.utils import ModelResponse
 
-from harbor_proximus import workload_identity
+from harbor_proximus.auth import (
+    ApiKeyLoader,
+    CredentialError,
+    resolve_credentials,
+)
 from harbor_proximus.config import BUDGET_MARGIN_SEC, ProximusConfig
 
 _MODEL_REGISTRATION_LOCK = threading.Lock()
@@ -49,93 +47,12 @@ def _register_model_info(model_info: dict[str, dict[str, Any]]) -> None:
             litellm.suppress_debug_info = suppress_debug_info
 
 
-# Providers whose credential in Harbor's PROVIDERS table is not a bearer API key.
-_NON_BEARER_PROVIDERS = frozenset({"amazon-bedrock", "sagemaker", "vertex_ai"})
-assert _NON_BEARER_PROVIDERS <= set(PROVIDERS)
-
-
 def _litellm_knows(model: str) -> bool:
     try:
         litellm.get_model_info(model)
     except Exception:
         return False
     return True
-
-
-@dataclass(frozen=True)
-class Credentials:
-    api_key: str | None
-    api_base: str | None
-    consumed_env_keys: frozenset[str]
-    """Agent-env variables used for the model, to hide from the sandbox."""
-    federation: workload_identity.WorkloadIdentityConfig | None = None
-    """Anthropic WIF settings, set when the model has no API key."""
-
-
-def resolve_credentials(
-    model_name: str,
-    api_key_env: str | None,
-    extra_env: dict[str, str] | None,
-    *,
-    anthropic_workload_identity: bool = False,
-) -> Credentials:
-    """The model's API key and base URL, as Harbor's own agents resolve them.
-
-    Harbor's agent env (`--ae`, AgentConfig.env) wins over the host, with the
-    provider's usual variable names; host variables stay with LiteLLM's own
-    lookup. ``api_key_env`` names the key variable explicitly (agent env, then
-    host) and must be set. Bedrock/SageMaker/Vertex "keys" in Harbor's table
-    are not bearer tokens, so those providers keep LiteLLM's lookup.
-
-    With ``anthropic_workload_identity`` the model has no API key: the WIF IDs
-    are read from the agent env, then the host. An API key in the agent env is
-    still hidden from the sandbox but never used.
-    """
-    agent_env = extra_env or {}
-    used: list[str] = []
-
-    def from_agent_env(*names: str) -> tuple[str, str] | None:
-        for name in names:
-            if name in agent_env:
-                used.append(name)
-                return name, agent_env[name]
-        return None
-
-    connection = resolve_model_connection(
-        model_name, ModelConnectionSpec(), from_agent_env
-    )
-    cloud_auth = connection.provider in _NON_BEARER_PROVIDERS
-    consumed = {
-        name for name in used if not cloud_auth or name.endswith(("_BASE", "_URL"))
-    }
-    if anthropic_workload_identity:
-        if connection.provider != "anthropic":
-            raise ValueError(
-                "anthropic_workload_identity needs an anthropic/ model, "
-                f"not {model_name!r}"
-            )
-
-        def lookup(name: str) -> str | None:
-            if name in agent_env:
-                consumed.add(name)
-                return agent_env[name]
-            return os.environ.get(name)
-
-        config = workload_identity.WorkloadIdentityConfig.from_env(lookup)
-        return Credentials(
-            None, connection.configured_base_url, frozenset(consumed), config
-        )
-    api_key = None if cloud_auth else connection.api_key or None
-    if api_key_env:
-        api_key = agent_env.get(api_key_env, os.environ.get(api_key_env)) or None
-        if api_key is None:
-            raise ValueError(
-                f"api_key_env={api_key_env!r} is not set in the "
-                "environment — the run cannot authenticate this model."
-            )
-        if api_key_env in agent_env:
-            consumed.add(api_key_env)
-    return Credentials(api_key, connection.configured_base_url, frozenset(consumed))
 
 
 # Provider error strings that indicate context-window overflow
@@ -280,7 +197,7 @@ def _is_retryable(error: BaseException) -> bool:
         # CancelledError") until the SIGKILL, skipping auto-submission and
         # the end-of-run restore.
         return False
-    if isinstance(error, workload_identity.WorkloadIdentityError):
+    if isinstance(error, CredentialError):
         return error.retryable
     if isinstance(error, litellm.exceptions.ContentPolicyViolationError):
         return True
@@ -738,15 +655,11 @@ class LLM:
             model_name,
             config.api_key_env,
             extra_env,
-            anthropic_workload_identity=config.anthropic_workload_identity,
+            api_key_loader=config.api_key_loader,
         )
         self._api_key: str | None = credentials.api_key
+        self._api_key_loader: ApiKeyLoader | None = credentials.api_key_loader
         self._api_base: str | None = credentials.api_base
-        self._access_tokens: workload_identity.AccessTokenSource | None = None
-        if credentials.federation is not None:
-            self._access_tokens = workload_identity.shared_source(
-                credentials.federation
-            )
         # Proximus.run blanks these in the sandbox: Harbor overlays the agent
         # env onto sandbox commands.
         self.consumed_env_keys: frozenset[str] = credentials.consumed_env_keys
@@ -897,12 +810,10 @@ class LLM:
             completion_kwargs["reasoning_effort"] = self._config.reasoning_effort
         if self._api_key is not None:
             completion_kwargs["api_key"] = self._api_key
-        if self._access_tokens is not None:
-            # Checked on every attempt and refreshed when close to expiry.
-            # LiteLLM sends an sk-ant-oat token as `Authorization: Bearer`
-            # and never as x-api-key, and an explicit key stops it from
-            # falling back to ANTHROPIC_API_KEY.
-            completion_kwargs["api_key"] = await self._access_tokens.token()
+        if self._api_key_loader is not None:
+            # Loaded keys can expire, so load one for every attempt. An
+            # explicit key also stops LiteLLM's own env-var lookup.
+            completion_kwargs["api_key"] = await self._api_key_loader.load()
         if self._api_base is not None:
             completion_kwargs["api_base"] = self._api_base
         if self._config.api_base is not None:

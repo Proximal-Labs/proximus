@@ -52,14 +52,42 @@ sandbox, so the model cannot read them; Bedrock, SageMaker and Vertex keep
 LiteLLM's own lookup. Never put keys in `--ak` or `llm_call_kwargs`: Harbor saves
 agent options verbatim in job files.
 
-Anthropic models can use [Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/wif-providers/aws)
-instead of an API key: set `anthropic_workload_identity=true` and provide
-`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and, when the
-federation rule needs them, `ANTHROPIC_SERVICE_ACCOUNT_ID` and
-`ANTHROPIC_WORKSPACE_ID` (agent env, then shell). The host's AWS role mints a
-new STS identity token for each exchange (boto3 uses its default region), and
-Proximus renews the short-lived access token two minutes before it expires. No
-API key is read or sent in this mode.
+### Key loaders
+
+For credentials that expire, `api_key_loader` loads the key for each request
+instead of reading a fixed one. Its settings come from the agent env, then
+your shell, and they are hidden from the sandbox too. The built-in
+`anthropic_wif` uses Anthropic
+[Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/wif-providers/aws).
+The host's AWS role mints an STS identity token, and Proximus exchanges it for
+a short-lived access token, renewed two minutes before it expires:
+
+```sh
+harbor run ... --model anthropic/claude-opus-5 --ak api_key_loader=anthropic_wif \
+  --ae 'ANTHROPIC_FEDERATION_RULE_ID=${...}' --ae 'ANTHROPIC_ORGANIZATION_ID=${...}' \
+  --ae 'ANTHROPIC_SERVICE_ACCOUNT_ID=${...}' --ae 'ANTHROPIC_WORKSPACE_ID=${...}'
+```
+
+STS uses boto3's default region. Any other value is a `module:Class` path to
+your own loader:
+
+```python
+from harbor_proximus.auth import ApiKeyLoader, Env
+
+class VaultKey(ApiKeyLoader):
+    def __init__(self, path: str):
+        self.path = path
+
+    @classmethod
+    def from_env(cls, model_name: str, env: Env) -> "VaultKey":
+        return cls(env.require("VAULT_SECRET_PATH"))  # once, before the run
+
+    async def load(self) -> str:
+        ...  # before every request: return a cached key or fetch a new one
+```
+
+A loader raises `CredentialError(..., retryable=False)` to fail the run at
+once rather than retry.
 
 ## Options and customization
 

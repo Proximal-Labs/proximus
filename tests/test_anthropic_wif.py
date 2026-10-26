@@ -1,6 +1,6 @@
-"""Anthropic Workload Identity Federation: the access token is exchanged from
-a fresh STS identity token, renewed before it expires, shared by concurrent
-callers, and sent as ``Authorization: Bearer`` with no ``x-api-key``.
+"""The ``anthropic_wif`` loader: the access token is exchanged from a fresh STS
+identity token, renewed before it expires, shared by concurrent callers, and
+sent as ``Authorization: Bearer`` with no ``x-api-key``.
 
 STS is a fake minter, the token endpoint an ``httpx.MockTransport``, and the
 Messages API a fake upstream behind ``httpx.AsyncClient.send``.
@@ -15,18 +15,17 @@ import time
 import httpx
 import pytest
 
-from harbor_proximus import workload_identity
-from harbor_proximus.config import ProximusConfig
-from harbor_proximus.llm import LLM, _is_retryable, resolve_credentials
-from harbor_proximus.workload_identity import (
+from harbor_proximus.auth import CredentialError, Env, resolve_credentials
+from harbor_proximus.auth.anthropic_wif import (
     AUDIENCE,
     REFRESH_MARGIN_SEC,
     TOKEN_URL,
-    AccessTokenSource,
+    AnthropicWIF,
+    FederationConfig,
     StsIdentityToken,
-    WorkloadIdentityConfig,
-    WorkloadIdentityError,
 )
+from harbor_proximus.config import ProximusConfig
+from harbor_proximus.llm import LLM, _is_retryable
 
 MODEL = "anthropic/claude-test"
 HOST_KEY = "sk-ant-api03-host-key-must-not-leak"
@@ -37,13 +36,23 @@ WIF_ENV = {
     "ANTHROPIC_SERVICE_ACCOUNT_ID": "svac_test",
     "ANTHROPIC_WORKSPACE_ID": "wrkspc_test",
 }
-CONFIG = WorkloadIdentityConfig(
+# What AnthropicWIF.from_env builds from WIF_ENV in us-west-2.
+CONFIG = FederationConfig(
     federation_rule_id="fdrl_test",
     organization_id="org-test",
     service_account_id="svac_test",
     workspace_id="wrkspc_test",
     sts_region="us-west-2",
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated(monkeypatch):
+    """A region, no host WIF settings, and no loaders shared between tests."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
+    for name in WIF_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(AnthropicWIF, "_shared", {})
 
 
 class FakeClock:
@@ -102,10 +111,10 @@ class FakeTokenEndpoint:
         )
 
 
-def make_source(
+def make_loader(
     endpoint: FakeTokenEndpoint, sts: FakeSts, clock: FakeClock | None = None
-) -> AccessTokenSource:
-    return AccessTokenSource(
+) -> AnthropicWIF:
+    return AnthropicWIF(
         CONFIG,
         identity_token=sts,
         transport=httpx.MockTransport(endpoint.handler),
@@ -115,7 +124,7 @@ def make_source(
 
 async def test_exchange_sends_a_fresh_sts_token_and_the_ids():
     endpoint, sts = FakeTokenEndpoint(), FakeSts()
-    token = await make_source(endpoint, sts).token()
+    token = await make_loader(endpoint, sts).load()
 
     assert token == "sk-ant-oat01-test-1"
     (request,) = endpoint.requests
@@ -132,28 +141,28 @@ async def test_exchange_sends_a_fresh_sts_token_and_the_ids():
     assert "authorization" not in request.headers
 
 
-async def test_token_is_reused_until_close_to_expiry_then_refreshed():
+async def test_token_is_reused_until_close_to_expiry_then_renewed():
     endpoint, sts, clock = FakeTokenEndpoint(expires_in=600), FakeSts(), FakeClock()
-    source = make_source(endpoint, sts, clock)
+    loader = make_loader(endpoint, sts, clock)
 
-    first = await source.token()
+    first = await loader.load()
     clock.now += 600 - REFRESH_MARGIN_SEC - 1  # 121 s left: still fresh
-    assert await source.token() == first
+    assert await loader.load() == first
     assert len(endpoint.requests) == 1
 
     clock.now += 2  # 119 s left: renew before it lapses
-    second = await source.token()
+    second = await loader.load()
     assert second != first
     assert len(endpoint.requests) == 2
 
 
 async def test_every_exchange_uses_a_newly_minted_identity_token():
     endpoint, sts, clock = FakeTokenEndpoint(expires_in=600), FakeSts(), FakeClock()
-    source = make_source(endpoint, sts, clock)
+    loader = make_loader(endpoint, sts, clock)
 
     tokens = []
     for _ in range(5):
-        tokens.append(await source.token())
+        tokens.append(await loader.load())
         clock.now += 600  # expired
     assert len(set(tokens)) == 5
     assert endpoint.assertions == sts.minted
@@ -162,9 +171,9 @@ async def test_every_exchange_uses_a_newly_minted_identity_token():
 
 async def test_concurrent_callers_share_one_refresh():
     endpoint, sts = FakeTokenEndpoint(delay_sec=0.2), FakeSts()
-    source = make_source(endpoint, sts)
+    loader = make_loader(endpoint, sts)
 
-    tokens = await asyncio.gather(*(source.token() for _ in range(16)))
+    tokens = await asyncio.gather(*(loader.load() for _ in range(16)))
 
     assert set(tokens) == {"sk-ant-oat01-test-1"}
     assert len(endpoint.requests) == 1
@@ -174,9 +183,8 @@ async def test_concurrent_callers_share_one_refresh():
 async def test_a_rejected_exchange_fails_fast_without_leaking_the_assertion():
     endpoint, sts = FakeTokenEndpoint(), FakeSts()
     endpoint.status = 401
-    with pytest.raises(WorkloadIdentityError) as raised:
-        await make_source(endpoint, sts).token()
-    assert not raised.value.retryable
+    with pytest.raises(CredentialError) as raised:
+        await make_loader(endpoint, sts).load()
     assert not _is_retryable(raised.value)
     assert "Authentication failed" in str(raised.value)
     assert sts.minted[0] not in str(raised.value)
@@ -185,8 +193,8 @@ async def test_a_rejected_exchange_fails_fast_without_leaking_the_assertion():
 async def test_a_server_error_during_exchange_is_retryable():
     endpoint, sts = FakeTokenEndpoint(), FakeSts()
     endpoint.status = 503
-    with pytest.raises(WorkloadIdentityError) as raised:
-        await make_source(endpoint, sts).token()
+    with pytest.raises(CredentialError) as raised:
+        await make_loader(endpoint, sts).load()
     assert _is_retryable(raised.value)
 
 
@@ -238,24 +246,15 @@ def test_sts_access_denied_fails_fast(monkeypatch):
     client = FakeStsClient(error=denied)
     monkeypatch.setattr(Session, "client", lambda *a, **k: client)
 
-    with pytest.raises(WorkloadIdentityError) as raised:
+    with pytest.raises(CredentialError) as raised:
         StsIdentityToken("us-west-2")()
     assert not _is_retryable(raised.value)
 
 
-# Credential resolution
+# Configuration
 
 
-@pytest.fixture
-def aws_region(monkeypatch):
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
-
-
-def test_ids_come_from_agent_env_then_host_and_api_keys_are_unused(
-    monkeypatch, aws_region
-):
-    for name in WIF_ENV:
-        monkeypatch.delenv(name, raising=False)
+def test_ids_come_from_agent_env_then_host_and_api_keys_are_unused(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", HOST_KEY)
     monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_host")
     agent_env = {
@@ -265,11 +264,13 @@ def test_ids_come_from_agent_env_then_host_and_api_keys_are_unused(
     }
 
     credentials = resolve_credentials(
-        MODEL, None, agent_env, anthropic_workload_identity=True
+        MODEL, None, agent_env, api_key_loader="anthropic_wif"
     )
 
     assert credentials.api_key is None
-    assert credentials.federation == WorkloadIdentityConfig(
+    loader = credentials.api_key_loader
+    assert isinstance(loader, AnthropicWIF)
+    assert loader._config == FederationConfig(
         federation_rule_id="fdrl_agent",
         organization_id="org-agent",
         service_account_id=None,
@@ -284,24 +285,25 @@ def test_ids_come_from_agent_env_then_host_and_api_keys_are_unused(
     }
 
 
+def test_one_loader_per_configuration():
+    first = AnthropicWIF.from_env(MODEL, Env(WIF_ENV))
+    assert AnthropicWIF.from_env(MODEL, Env(dict(WIF_ENV))) is first
+    other = {**WIF_ENV, "ANTHROPIC_FEDERATION_RULE_ID": "fdrl_other"}
+    assert AnthropicWIF.from_env(MODEL, Env(other)) is not first
+
+
 @pytest.mark.parametrize(
-    ("model", "kwargs", "env", "message"),
+    ("model", "env", "message"),
     [
-        (MODEL, {}, {}, "ANTHROPIC_FEDERATION_RULE_ID"),
-        ("openai/gpt-test", {}, WIF_ENV, "anthropic/ model"),
-        (MODEL, {"api_key_env": "MY_KEY"}, WIF_ENV, "not both"),
+        (MODEL, {}, "ANTHROPIC_FEDERATION_RULE_ID"),
+        ("openai/gpt-test", WIF_ENV, "anthropic/ model"),
     ],
 )
-def test_invalid_setup_fails_at_construction(
-    monkeypatch, aws_region, model, kwargs, env, message
-):
-    for name in WIF_ENV:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("MY_KEY", HOST_KEY)
+def test_invalid_setup_fails_at_construction(model, env, message):
     with pytest.raises(ValueError, match=message):
         LLM(
             model,
-            ProximusConfig(anthropic_workload_identity=True, **kwargs),
+            ProximusConfig(api_key_loader="anthropic_wif"),
             remaining_sec=lambda: None,
             logger=logging.getLogger("t"),
             extra_env=env,
@@ -313,7 +315,7 @@ def test_missing_aws_region_fails_at_construction(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing"))
     with pytest.raises(ValueError, match="AWS_DEFAULT_REGION"):
-        resolve_credentials(MODEL, None, WIF_ENV, anthropic_workload_identity=True)
+        AnthropicWIF.from_env(MODEL, Env(WIF_ENV))
 
 
 # The request on the wire
@@ -379,17 +381,19 @@ def upstream(monkeypatch):
     return sent
 
 
-def wif_llm(monkeypatch, source: AccessTokenSource, **options) -> LLM:
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
+def wif_llm(monkeypatch, loader: AnthropicWIF, **options) -> LLM:
+    """An LLM whose anthropic_wif loader (built from WIF_ENV) is ``loader``."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", HOST_KEY)
-    monkeypatch.setattr(workload_identity, "shared_source", lambda config: source)
-    return LLM(
+    monkeypatch.setitem(AnthropicWIF._shared, CONFIG, loader)
+    llm = LLM(
         MODEL,
-        ProximusConfig(anthropic_workload_identity=True, **options),
+        ProximusConfig(api_key_loader="anthropic_wif", **options),
         remaining_sec=lambda: None,
         logger=logging.getLogger("t"),
         extra_env={**WIF_ENV, "ANTHROPIC_API_KEY": AGENT_KEY},
     )
+    assert llm._api_key_loader is loader
+    return llm
 
 
 MESSAGES = [{"role": "user", "content": "Reply with ok."}]
@@ -403,8 +407,8 @@ MESSAGES = [{"role": "user", "content": "Reply with ok."}]
 async def test_access_token_is_sent_as_bearer_without_x_api_key(
     monkeypatch, upstream, llm_call_kwargs
 ):
-    source = make_source(FakeTokenEndpoint(), FakeSts())
-    llm = wif_llm(monkeypatch, source, llm_call_kwargs=llm_call_kwargs)
+    loader = make_loader(FakeTokenEndpoint(), FakeSts())
+    llm = wif_llm(monkeypatch, loader, llm_call_kwargs=llm_call_kwargs)
 
     parsed = await llm.query(MESSAGES, tools=None)
 
@@ -419,7 +423,7 @@ async def test_access_token_is_sent_as_bearer_without_x_api_key(
 
 async def test_each_request_renews_an_expiring_token(monkeypatch, upstream):
     endpoint, sts, clock = FakeTokenEndpoint(expires_in=600), FakeSts(), FakeClock()
-    llm = wif_llm(monkeypatch, make_source(endpoint, sts, clock))
+    llm = wif_llm(monkeypatch, make_loader(endpoint, sts, clock))
 
     await llm.query(MESSAGES, tools=None)
     clock.now += 300
@@ -448,10 +452,10 @@ async def test_api_key_mode_is_unchanged(monkeypatch, upstream):
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("ANTHROPIC_API_KEY", HOST_KEY)
 
-    def no_source(config):
-        raise AssertionError("WIF is opt-in")
+    def no_loader(*args, **kwargs):
+        raise AssertionError("api_key_loader is opt-in")
 
-    monkeypatch.setattr(workload_identity, "shared_source", no_source)
+    monkeypatch.setattr(AnthropicWIF, "from_env", no_loader)
     llm = LLM(
         MODEL,
         ProximusConfig(),
@@ -466,16 +470,3 @@ async def test_api_key_mode_is_unchanged(monkeypatch, upstream):
     assert request.headers["x-api-key"] == AGENT_KEY
     assert "authorization" not in request.headers
     assert llm.consumed_env_keys == {"ANTHROPIC_API_KEY"}
-
-
-def test_shared_source_is_one_per_configuration():
-    other = WorkloadIdentityConfig(
-        federation_rule_id="fdrl_other",
-        organization_id="org-test",
-        service_account_id=None,
-        workspace_id=None,
-        sts_region="us-west-2",
-    )
-    source = workload_identity.shared_source(CONFIG)
-    assert workload_identity.shared_source(CONFIG) is source
-    assert workload_identity.shared_source(other) is not source
