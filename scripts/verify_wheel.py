@@ -42,7 +42,8 @@ def main() -> None:
             check=True,
         ).stdout.splitlines()
         dependencies = [
-            str(wheel),
+            # The [gemini] extra too: the suite covers the Interactions API path.
+            f"{wheel}[gemini]",
             "pytest>=8.4.2",
             "pytest-asyncio>=1.2",
             "pillow>=10",

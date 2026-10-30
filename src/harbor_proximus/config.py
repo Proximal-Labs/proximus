@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from harbor.agents.options import AgentOptions
 from harbor.utils.templating import render_prompt_template
@@ -96,6 +96,18 @@ class ProximusConfig(AgentOptions):
     api_base: str | None = None
     """Base URL of the model API."""
 
+    model_api: Literal["chat", "gemini_interactions"] = "chat"
+    """How requests reach the model. ``chat`` (the default) goes through
+    LiteLLM. ``gemini_interactions`` sends ``gemini/`` models to Google's
+    Interactions API with the ``google-genai`` SDK (install
+    ``harbor-proximus[gemini]``). Interactions are stored, as Google
+    recommends, and each turn continues the previous one; set ``store: false``
+    in ``llm_call_kwargs`` to send the whole history every turn instead.
+    ``reasoning_effort``
+    becomes ``thinking_level``; ``max_tokens`` and other sampling settings in
+    ``llm_call_kwargs`` go into ``generation_config``. LiteLLM logging callbacks
+    fire for each request, as on the chat path."""
+
     max_thinking_tokens: int | None = Field(default=None, ge=1024)
     """Thinking budget for Anthropic models (at least 1024). Cannot be combined
     with ``reasoning_effort``."""
@@ -114,6 +126,18 @@ class ProximusConfig(AgentOptions):
             # Raises unless the template uses {{ instruction }}.
             render_prompt_template(Path(value), "instruction")
         return value
+
+    @model_validator(mode="after")
+    def _interactions_thinking_level_only(self) -> Self:
+        if (
+            self.model_api == "gemini_interactions"
+            and self.max_thinking_tokens is not None
+        ):
+            raise ValueError(
+                "model_api='gemini_interactions' uses reasoning_effort "
+                "(thinking_level), not max_thinking_tokens"
+            )
+        return self
 
     @model_validator(mode="after")
     def _one_thinking_control(self) -> Self:
