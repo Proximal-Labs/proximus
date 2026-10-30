@@ -487,7 +487,7 @@ class _CallLog:
 
 
 class InteractionsClient:
-    """One async google-genai client per LLM; requests are stateless."""
+    """One async google-genai client per LLM."""
 
     def __init__(self, model_name: str, api_key: str | None, api_base: str | None):
         try:
@@ -505,7 +505,13 @@ class InteractionsClient:
         sdk = self._client.aio.interactions.sdk_configuration
         # The agent loop owns retries and logs every attempt. The SDK's
         # Interactions layer retries at least once whatever retry_options
-        # say, which would hide a failed request, so turn it off.
+        # say, which would hide a failed request, so turn it off. This is
+        # private SDK API: fail loudly rather than retry unlogged if it moves.
+        if not hasattr(sdk, "retry_config"):
+            raise RuntimeError(
+                "this google-genai version has no Interactions retry_config; "
+                "model_api='gemini_interactions' cannot turn off its retries"
+            )
         sdk.retry_config = RetryConfig("none", None, False)
         self._server_url = sdk.get_server_details()[0]
         self._api_version = sdk.globals.api_version

@@ -550,6 +550,38 @@ async def test_each_failed_attempt_is_logged(tmp_path, server, payloads, monkeyp
     assert logged[0]["id"] != logged[1]["id"]
 
 
+async def test_retry_of_a_chained_turn_resends_the_same_request(
+    tmp_path, server, monkeypatch
+):
+    monkeypatch.setattr("tenacity.wait_random_exponential", lambda **_: 0)
+    server.replies = [
+        interaction([call_step("c1", "bash", command="ls")]),
+        api_error(503, "The model is overloaded."),
+        interaction(
+            [{"type": "model_output", "error": {"code": 13, "message": "Internal."}}],
+            status="completed",
+            id="i-failed",
+        ),
+        interaction([call_step("c2", "submit")], id="i-2"),
+    ]
+    agent = make_agent(tmp_path)
+    first = [{"role": "user", "content": "List the files."}]
+    turn = await agent._llm.query(first, tools=None)
+    second = [
+        *first,
+        agent._llm.assistant_message(turn),
+        {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+    ]
+    parsed = await agent._llm.query(second, tools=None)
+
+    assert parsed.tool_calls[0].name == "submit"
+    retried = server.requests[1:]
+    assert len(retried) == 3
+    # A failed attempt never becomes the parent of the next one.
+    assert {body["previous_interaction_id"] for body in retried} == {"i-1"}
+    assert retried[0]["input"] == retried[1]["input"] == retried[2]["input"]
+
+
 @pytest.mark.parametrize(
     ("status", "steps", "errors"),
     [
