@@ -52,6 +52,42 @@ sandbox, so the model cannot read them; Bedrock, SageMaker and Vertex keep
 LiteLLM's own lookup. Never put keys in `--ak` or `llm_call_kwargs`: Harbor saves
 agent options verbatim in job files.
 
+### Gemini through the Interactions API
+
+`model_api="gemini_interactions"` sends a `gemini/…` model to Google's
+[Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
+with the `google-genai` SDK instead of LiteLLM's `generateContent` route. Install
+the extra: `harbor-proximus[gemini]`.
+
+- **Stored, as Google recommends.** Interactions are stored (`store=true`) and
+  each turn continues the previous one with `previous_interaction_id`, sending
+  only the new steps. Google keeps stored interactions for a limited time (see
+  its data retention terms). After compaction or image eviction rewrites the
+  history, the next request sends the whole history and starts a new chain.
+- **Stateless on request.** With `llm_call_kwargs={"store": false}` every
+  request sends the whole history. The model's own steps (thoughts with
+  signatures, function calls, output) are kept on each assistant message and
+  replayed verbatim, as stateless requests require.
+- **Settings.** `reasoning_effort` becomes `thinking_level`, with thought
+  summaries on. In `llm_call_kwargs`, `max_tokens`, `temperature`, `top_p`,
+  `seed`, `stop` and a `generation_config` dict go into `generation_config`;
+  `timeout`, `api_version`, `extra_headers` and `extra_body` are SDK call
+  options; any other key is sent as a top-level request field.
+- **Same handling.** Replies, usage (thought tokens count as completion tokens,
+  as on `generateContent`), cost from the model's LiteLLM prices, retries and
+  context-overflow recovery work as on the default path. The SDK's own retries
+  are off, so each attempt is one HTTP request.
+- **Logged by LiteLLM.** LiteLLM logging callbacks fire for every attempt,
+  success or failure, with the standard logging payload of a chat completion:
+  `api_base` is the Interactions endpoint and `messages` the chat history.
+- **Failed interactions.** An interaction with status `failed`, or with an error
+  on a `model_output` step, raises a retryable `InternalServerError` carrying
+  the raw status and errors. The Interaction schema has no refusal or safety
+  field, so a blocked reply cannot be told from a server fault except by those
+  details.
+  Each reply's choice records the raw status as `interaction_status`.
+- **Key.** `GEMINI_API_KEY` (or `api_key_env`), as for `gemini/` on LiteLLM.
+
 ## Options and customization
 
 Options follow Harbor's Terminus 2 names where they exist: `max_turns`,
