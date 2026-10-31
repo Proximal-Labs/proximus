@@ -273,3 +273,18 @@ def test_config_default_temperature_error_reaches_caller(monkeypatch):
     assert config.temperature is None
     with pytest.raises(ValueError, match="Gemini Interactions requires temperature"):
         LLM("gemini/test-model", config, lambda: None, logging.getLogger(__name__))
+
+
+def test_config_default_reasoning_effort_error_reaches_caller(monkeypatch):
+    import logging
+
+    from harbor_proximus.config import ProximusConfig
+    from harbor_proximus.llm import LLM
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    config = ProximusConfig(model_api="gemini_interactions", temperature=0.0)
+    assert config.reasoning_effort is None
+    with pytest.raises(
+        ValueError, match="Gemini Interactions requires reasoning_effort"
+    ):
+        LLM("gemini/test-model", config, lambda: None, logging.getLogger(__name__))

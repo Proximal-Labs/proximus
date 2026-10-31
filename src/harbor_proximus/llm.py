@@ -690,6 +690,11 @@ class LLM:
     ):
         if config.model_api == "gemini_interactions" and config.temperature is None:
             raise ValueError("Gemini Interactions requires temperature")
+        if (
+            config.model_api == "gemini_interactions"
+            and config.reasoning_effort is None
+        ):
+            raise ValueError("Gemini Interactions requires reasoning_effort")
         _install_litellm_reasoning_only_patch()
         self.model_name = model_name
         self._config = config
