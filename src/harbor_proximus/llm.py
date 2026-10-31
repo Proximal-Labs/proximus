@@ -25,7 +25,9 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
 from litellm.types.utils import ModelResponse
 
+from harbor_proximus import gemini_interactions
 from harbor_proximus.config import BUDGET_MARGIN_SEC, ProximusConfig
+from harbor_proximus.prompts import NO_OUTPUT_PLACEHOLDER
 
 _MODEL_REGISTRATION_LOCK = threading.Lock()
 
@@ -686,6 +688,8 @@ class LLM:
         *,
         extra_env: dict[str, str] | None = None,
     ):
+        if config.model_api == "gemini_interactions" and config.temperature is None:
+            raise ValueError("Gemini Interactions requires temperature")
         _install_litellm_reasoning_only_patch()
         self.model_name = model_name
         self._config = config
@@ -713,6 +717,16 @@ class LLM:
         # Set by the agent once the run's session id exists; scopes the
         # provider-side prompt cache to this run.
         self.session_id: str = ""
+        self._interactions: gemini_interactions.InteractionsClient | None = None
+        if config.model_api == "gemini_interactions":
+            if not model_name.startswith("gemini/"):
+                raise ValueError(
+                    "model_api='gemini_interactions' needs a gemini/ model, "
+                    f"not {model_name!r}"
+                )
+            self._interactions = gemini_interactions.InteractionsClient(
+                model_name, self._api_key, config.api_base or self._api_base
+            )
 
     def resolve_context_limit(self) -> int:
         error = f"No valid max_input_tokens for {self.model_name!r}."
@@ -878,22 +892,33 @@ class LLM:
             completion_kwargs["client"] = fallback_handler
 
         try:
-            raw_response = await litellm.acompletion(**completion_kwargs)
-            if completion_kwargs.get("stream"):
-                # Streaming keeps long reasoning turns active at gateways which
-                # otherwise buffer the full Anthropic response and time it out.
-                # Rebuild the ordinary ModelResponse so all downstream parsing
-                # (reasoning blocks, partial tool JSON, usage/cache telemetry,
-                # finish reasons, and cost) follows the same path as before.
-                chunks = [chunk async for chunk in raw_response]
-                built = litellm.stream_chunk_builder(chunks, messages=messages)
-                if built is None:
-                    raise RuntimeError(
-                        f"Model {self.model_name} returned an empty stream."
-                    )
-                response = cast(ModelResponse, built)
+            if self._interactions is not None:
+                request = gemini_interactions.build_request(
+                    self.model_name,
+                    messages,
+                    tools,
+                    reasoning_effort=self._config.reasoning_effort,
+                    temperature=self._config.temperature,
+                    call_kwargs={"timeout": timeout, **self._config.llm_call_kwargs},
+                )
+                response = await self._interactions.create(request)
             else:
-                response = cast(ModelResponse, raw_response)
+                raw_response = await litellm.acompletion(**completion_kwargs)
+                if completion_kwargs.get("stream"):
+                    # Streaming keeps long reasoning turns active at gateways which
+                    # otherwise buffer the full Anthropic response and time it out.
+                    # Rebuild the ordinary ModelResponse so all downstream parsing
+                    # (reasoning blocks, partial tool JSON, usage/cache telemetry,
+                    # finish reasons, and cost) follows the same path as before.
+                    chunks = [chunk async for chunk in raw_response]
+                    built = litellm.stream_chunk_builder(chunks, messages=messages)
+                    if built is None:
+                        raise RuntimeError(
+                            f"Model {self.model_name} returned an empty stream."
+                        )
+                    response = cast(ModelResponse, built)
+                else:
+                    response = cast(ModelResponse, raw_response)
         except litellm.exceptions.ContextWindowExceededError as e:
             raise ContextLengthExceededError from e
         except litellm.exceptions.BadRequestError as e:
@@ -1146,7 +1171,7 @@ class LLM:
         # An assistant message with neither content nor tool_calls is invalid
         # at several providers
         if not message.get("tool_calls") and not message.get("content"):
-            message["content"] = "(no output this turn)"
+            message["content"] = NO_OUTPUT_PLACEHOLDER
         return message
 
     @staticmethod
