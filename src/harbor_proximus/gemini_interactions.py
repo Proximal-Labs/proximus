@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import litellm
+from litellm.litellm_core_utils.llm_cost_calc.usage_object_transformation import (
+    InteractionsUsageObjectTransformation,
+)
 from litellm.types.utils import (
     ChatCompletionMessageToolCall,
     Choices,
@@ -28,6 +31,12 @@ _GENERATION_KEYS = {
     "stop": "stop_sequences",
     "stop_sequences": "stop_sequences",
 }
+# Interaction statuses that carry no usable turn; retried like a provider error.
+_FAILED_STATUSES = {"failed", "cancelled"}
+
+
+class InteractionFailedError(RuntimeError):
+    """Google ended the interaction as failed or cancelled."""
 
 
 @dataclass(frozen=True)
@@ -208,6 +217,7 @@ def to_model_response(
     model_name: str,
     steps: list[dict[str, Any]],
     status: str | None,
+    usage: dict[str, Any] | None,
     hidden_params: dict[str, Any],
 ) -> ModelResponse:
     """Convert model steps to a chat choice, retaining raw steps for replay."""
@@ -256,11 +266,17 @@ def to_model_response(
         finish_reason=finish,
         provider_specific_fields={"interaction_status": status},
     )
+    # Google reports total_input_tokens etc.; the agent reads chat-style
+    # prompt/completion/cached/reasoning counts for metrics and compaction.
+    transform = (
+        InteractionsUsageObjectTransformation.transform_interactions_usage_object
+    )
     response = ModelResponse(
         id=f"interaction-{uuid.uuid4().hex[:12]}",
         created=int(time.time()),
         model=model_name,
         choices=[choice],
+        usage=transform(usage) if usage else None,
     )
 
     response._hidden_params = dict(hidden_params)
@@ -282,9 +298,14 @@ class InteractionsClient:
             api_key=self.api_key,
             api_base=self.api_base,
         )
+        if interaction.status in _FAILED_STATUSES:
+            raise InteractionFailedError(
+                f"Gemini interaction {interaction.id} ended {interaction.status}"
+            )
         return to_model_response(
             self.model_name,
             interaction.steps or [],
             interaction.status,
+            interaction.usage,
             interaction._hidden_params,
         )

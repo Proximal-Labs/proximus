@@ -8,6 +8,7 @@ import pytest
 from litellm import exceptions
 
 from harbor_proximus import gemini_interactions as gi
+from harbor_proximus.llm import _is_retryable
 
 _REAL_CONNECT = socket.socket.connect
 
@@ -108,7 +109,7 @@ def test_response_maps_to_a_chat_choice():
         "total_tokens": 1250,
     }
     response = gi.to_model_response(
-        "gemini/test-model", steps, "requires_action", usage
+        "gemini/test-model", steps, "requires_action", usage, {"response_cost": 0.01}
     )
     message: Any = response.choices[0].message
     assert message.content == "Listing."
@@ -117,7 +118,39 @@ def test_response_maps_to_a_chat_choice():
     assert json.loads(message.tool_calls[0].function.arguments) == {"command": "ls"}
     assert message.provider_specific_fields == {gi.STEPS_FIELD: steps}
     assert response.choices[0].finish_reason == "tool_calls"
-    assert response._hidden_params == usage
+    assert response._hidden_params == {"response_cost": 0.01}
+    usage_out: Any = getattr(response, "usage")
+    assert usage_out.prompt_tokens == 1000
+    assert usage_out.completion_tokens == 250
+    assert usage_out.prompt_tokens_details.cached_tokens == 600
+    assert usage_out.completion_tokens_details.reasoning_tokens == 200
+
+
+def test_usage_reaches_parsed_turn(monkeypatch):
+    import logging
+
+    from harbor_proximus.config import ProximusConfig
+    from harbor_proximus.llm import LLM
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    config = ProximusConfig(
+        model_api="gemini_interactions", reasoning_effort="high", temperature=0.0
+    )
+    llm = LLM("gemini/test-model", config, lambda: None, logging.getLogger(__name__))
+    usage = {
+        "total_input_tokens": 1000,
+        "total_output_tokens": 50,
+        "total_thought_tokens": 200,
+        "total_cached_tokens": 600,
+    }
+    steps = [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}]
+    parsed = llm._parse_response(
+        gi.to_model_response("gemini/test-model", steps, "completed", usage, {})
+    )
+    assert parsed.prompt_tokens == 1000
+    assert parsed.completion_tokens == 250
+    assert parsed.cached_tokens == 600
+    assert parsed.reasoning_tokens == 200
 
 
 def test_request_settings():
@@ -232,6 +265,12 @@ async def test_litellm_transport_and_replay(monkeypatch):
             with pytest.raises(error):
                 await client.create(request([{"role": "user", "content": "hi"}]))
             assert len(requests) == before + 1
+        code = 200
+        for status in ("failed", "cancelled"):
+            reply = interaction([], status=status)
+            with pytest.raises(gi.InteractionFailedError, match=status) as failed:
+                await client.create(request([{"role": "user", "content": "hi"}]))
+            assert _is_retryable(failed.value)
     finally:
         server.shutdown()
         server.server_close()
@@ -288,3 +327,16 @@ def test_config_default_reasoning_effort_error_reaches_caller(monkeypatch):
         ValueError, match="Gemini Interactions requires reasoning_effort"
     ):
         LLM("gemini/test-model", config, lambda: None, logging.getLogger(__name__))
+
+
+def test_config_rejects_unknown_thinking_level():
+    from pydantic import ValidationError
+
+    from harbor_proximus.config import ProximusConfig
+
+    with pytest.raises(ValidationError, match="xhigh"):
+        ProximusConfig(
+            model_api="gemini_interactions", reasoning_effort="xhigh", temperature=0.0
+        )
+    # Chat models keep their own effort names.
+    ProximusConfig(reasoning_effort="xhigh")

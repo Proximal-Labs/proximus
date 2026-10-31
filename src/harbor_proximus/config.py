@@ -9,6 +9,8 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 # long before the budget runs out, and a model request always gets at least
 # this long, so the run can still finish cleanly.
 BUDGET_MARGIN_SEC = 120
+# thinking_level values the Gemini Interactions API accepts.
+GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 
 class ProximusConfig(AgentOptions):
@@ -133,6 +135,15 @@ class ProximusConfig(AgentOptions):
             raise ValueError(
                 "model_api='gemini_interactions' uses reasoning_effort "
                 "(thinking_level), not max_thinking_tokens"
+            )
+        if (
+            self.model_api == "gemini_interactions"
+            and self.reasoning_effort is not None
+            and self.reasoning_effort not in GEMINI_THINKING_LEVELS
+        ):
+            raise ValueError(
+                "model_api='gemini_interactions' needs reasoning_effort in "
+                f"{sorted(GEMINI_THINKING_LEVELS)}, got {self.reasoning_effort!r}"
             )
         return self
 
