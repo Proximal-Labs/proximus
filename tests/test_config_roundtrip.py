@@ -58,10 +58,10 @@ def write_task(task_dir: Path, table: dict[str, Any], header: str = "") -> Path:
     return task_dir
 
 
-def make_agent(kwargs: dict[str, Any], logs_dir: Path):
+def make_agent(kwargs: dict[str, Any], logs_dir: Path, model: str = MODEL):
     return AgentFactory.create_agent_from_config(
         AgentConfig(
-            import_path="harbor_proximus:Proximus", model_name=MODEL, kwargs=kwargs
+            import_path="harbor_proximus:Proximus", model_name=model, kwargs=kwargs
         ),
         logs_dir=logs_dir,
     )
@@ -92,6 +92,7 @@ FIELD_VALUES: dict[str, Any] = {
     "temperature": 0.3,
     "api_base": "http://127.0.0.1:9/v1",
     "max_thinking_tokens": 2048,
+    "model_api": "gemini_interactions",
     "model_info": {"max_input_tokens": 77777, "supports_vision": False},
 }
 
@@ -109,6 +110,9 @@ def test_every_field_round_trips_through_task_toml_and_factory(
     tmp_path, field, monkeypatch
 ):
     value = FIELD_VALUES[field]
+    # The Interactions API is Gemini-only.
+    model = "gemini/test-model" if field == "model_api" else MODEL
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     expected = value
@@ -118,12 +122,15 @@ def test_every_field_round_trips_through_task_toml_and_factory(
     if field == "api_key_env":
         monkeypatch.setenv(value, "roundtrip-key")
 
-    kwargs = task_agent_kwargs(write_task(task_dir, {field: value}), MODEL)
+    kwargs = task_agent_kwargs(write_task(task_dir, {field: value}), model)
     assert kwargs[field] == expected
     # No [agent].timeout_sec and no /app artifact: nothing else is defaulted.
     assert set(kwargs) == {field}
 
-    agent = make_agent(kwargs, tmp_path / "logs")
+    if field == "model_api":
+        kwargs["temperature"] = 0.0  # Interactions requires an explicit temperature.
+        kwargs["reasoning_effort"] = "high"
+    agent = make_agent(kwargs, tmp_path / "logs", model)
     assert getattr(agent.config, field) == expected
 
     if field == "disallowed_tools":
@@ -143,8 +150,13 @@ def test_all_fields_together(tmp_path, monkeypatch):
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     (task_dir / "prompt.j2").write_text("{{ instruction }}")
-    # max_thinking_tokens and reasoning_effort are mutually exclusive.
-    values = {k: v for k, v in FIELD_VALUES.items() if k != "max_thinking_tokens"}
+    # max_thinking_tokens and reasoning_effort are mutually exclusive, and
+    # model_api=gemini_interactions needs a gemini/ model.
+    values = {
+        k: v
+        for k, v in FIELD_VALUES.items()
+        if k not in ("max_thinking_tokens", "model_api")
+    }
     kwargs = task_agent_kwargs(write_task(task_dir, values), MODEL)
     agent = make_agent(kwargs, tmp_path / "logs")
     for field, value in values.items():
