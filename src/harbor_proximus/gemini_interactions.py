@@ -1,5 +1,6 @@
 """Stateless Gemini Interactions through LiteLLM."""
 
+import asyncio
 import json
 import time
 import uuid
@@ -33,6 +34,8 @@ _GENERATION_KEYS = {
 }
 # Interaction statuses that carry no usable turn; retried like a provider error.
 _FAILED_STATUSES = {"failed", "cancelled"}
+# The API rejects empty text blocks; this is the bash tool's wording for no output.
+_EMPTY_RESULT = "(no output)"
 
 
 class InteractionFailedError(RuntimeError):
@@ -80,11 +83,31 @@ def _text_of(content: Any) -> str:
     )
 
 
+def _replayable(step: dict[str, Any]) -> dict[str, Any] | None:
+    """A stored step as it may be sent back. The API rejects any request holding
+    an empty text block ("Missing text in content of type text."), yet a
+    model_output can arrive whose only text block is empty and carries citation
+    annotations. Drop empty text blocks, and the step once nothing is left."""
+    if step.get("type") != "model_output":
+        return dict(step)
+    content = [
+        part
+        for part in step.get("content") or []
+        if not (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and not part.get("text")
+        )
+    ]
+    return {**step, "content": content} if content else None
+
+
 def _assistant_steps(message: Message) -> list[dict[str, Any]]:
     fields = message.get("provider_specific_fields")
     stored = fields.get(STEPS_FIELD) if isinstance(fields, dict) else None
     if isinstance(stored, list) and stored:
-        return [dict(step) for step in stored]
+        replayed = (_replayable(step) for step in stored if isinstance(step, dict))
+        return [step for step in replayed if step is not None]
     # No recorded steps (a turn not produced by this API): rebuild what we can.
     steps: list[dict[str, Any]] = []
     text = _text_of(message.get("content"))
@@ -136,7 +159,9 @@ def to_input(
             result: dict[str, Any] = {
                 "type": "function_result",
                 "call_id": call_id,
-                "result": [_text_content(_text_of(message.get("content")))],
+                "result": [
+                    _text_content(_text_of(message.get("content")) or _EMPTY_RESULT)
+                ],
             }
             if call_names.get(call_id):
                 result["name"] = call_names[call_id]
@@ -258,6 +283,8 @@ def to_model_response(
     )
     if status in ("incomplete", "budget_exceeded"):
         finish = "length"
+    elif status == "recitation":
+        finish = "content_filter"
     else:
         finish = "tool_calls" if calls else "stop"
     choice = Choices(
@@ -292,12 +319,32 @@ class InteractionsClient:
         self.api_base = api_base
 
     async def create(self, request: Request) -> ModelResponse:
-        interaction: Any = await litellm.interactions.acreate(
-            **request.body,
-            **request.options,
-            api_key=self.api_key,
-            api_base=self.api_base,
-        )
+        timeout = request.options.get("timeout")
+        try:
+            # HTTP timeouts apply per read, so a slowly trickling reply could
+            # outlast them; bound the whole call.
+            async with asyncio.timeout(
+                timeout if isinstance(timeout, int | float) else None
+            ):
+                interaction: Any = await litellm.interactions.acreate(
+                    **request.body,
+                    **request.options,
+                    api_key=self.api_key,
+                    api_base=self.api_base,
+                )
+        except TimeoutError as error:
+            raise litellm.exceptions.Timeout(
+                message=f"Gemini interaction did not finish within {timeout}s",
+                model=self.model_name,
+                llm_provider="gemini",
+            ) from error
+        except litellm.exceptions.BadRequestError as error:
+            if "recitation" not in str(error).lower():
+                raise
+            # Output blocked as recitation arrives as a 400. generateContent
+            # reports it as finishReason RECITATION, which the chat path gets
+            # back as an empty content_filter turn; do the same.
+            return to_model_response(self.model_name, [], "recitation", None, {})
         if interaction.status in _FAILED_STATUSES:
             raise InteractionFailedError(
                 f"Gemini interaction {interaction.id} ended {interaction.status}"
