@@ -879,6 +879,8 @@ class Proximus(BaseAgent):
                 "request_fallbacks": parsed.request_fallbacks,
             },
         }
+        if parsed.extras:
+            extra["provider"] = parsed.extras
         if images:
             extra["images"] = images
         self._add_step(
