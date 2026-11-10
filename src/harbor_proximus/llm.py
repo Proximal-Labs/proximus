@@ -320,6 +320,26 @@ def _reasoning_item_dict(item: Any) -> dict[str, Any]:
     )
 
 
+def _keep_every_reasoning_item(choices: list[Any], output_items: list[Any]) -> None:
+    """Put all of a turn's reasoning items, in order, on its first choice.
+
+    LiteLLM's chat bridge keeps one pending reasoning item and overwrites it
+    for each one in the output, so a turn with several keeps only the last
+    (and repeats it on every choice). Replaying part of a turn's reasoning
+    makes the Responses API reject the request as invalid."""
+    reasoning = [
+        _reasoning_item_dict(item)
+        for item in output_items
+        if _is_reasoning_output_item(item)
+    ]
+    if not reasoning:
+        return
+    for index, choice in enumerate(choices):
+        message = getattr(choice, "message", None)
+        if message is not None:
+            message.reasoning_items = reasoning if index == 0 else None
+
+
 def _choices_from_reasoning_only_output(output_items: list[Any]) -> list[Any]:
     """A Responses turn that is only reasoning still has a CoT to replay.
 
@@ -364,9 +384,10 @@ def _install_litellm_reasoning_only_patch() -> None:
         handle_raw_dict_callback: Callable | None = None,
     ) -> list[Any]:
         choices = orig(output_items, handle_raw_dict_callback=handle_raw_dict_callback)
-        if choices:
-            return choices
         items = list(output_items or [])
+        if choices:
+            _keep_every_reasoning_item(choices, items)
+            return choices
         if items and all(_is_reasoning_output_item(item) for item in items):
             return _choices_from_reasoning_only_output(items)
         if not items:
@@ -739,6 +760,20 @@ def _response_extras(response: Any) -> dict[str, Any]:
         if hidden.get("proximus_latency_sec") is not None:
             extras["latency_sec"] = hidden["proximus_latency_sec"]
     return extras
+
+
+def _replayable_reasoning_items(items: list[Any]) -> list[Any]:
+    """Reasoning items as they go back to a Responses API: the encrypted
+    content without the readable summary. LiteLLM's chat-to-Responses bridge
+    re-emits summary parts without their ``type``, which the API rejects as
+    an invalid request; the summary is display text (kept in
+    ``reasoning_content``) and the model's reasoning is the encrypted part."""
+    replayable = []
+    for item in items:
+        if isinstance(item, dict) and item.get("summary"):
+            item = {**item, "summary": []}
+        replayable.append(item)
+    return replayable
 
 
 class LLM:
@@ -1210,6 +1245,9 @@ class LLM:
         ):
             prose: Message = {"role": "assistant", "content": parsed.content}
             message["content"] = None
+            # Reasoning precedes the prose in the model's output; replay it
+            # in that order.
+            prose["reasoning_items"] = message.pop("reasoning_items")
             return [prose, message]
         return [message]
 
@@ -1236,7 +1274,9 @@ class LLM:
             message["thinking_blocks"] = parsed.thinking_blocks
         if parsed.reasoning_items:
             # Responses API uses opaque items instead of its readable summary.
-            message["reasoning_items"] = parsed.reasoning_items
+            message["reasoning_items"] = _replayable_reasoning_items(
+                parsed.reasoning_items
+            )
         elif parsed.reasoning_content:
             message["reasoning_content"] = parsed.reasoning_content
         if parsed.provider_specific_fields:

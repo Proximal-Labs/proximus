@@ -63,6 +63,24 @@ default behavior, and `llm_call_kwargs` wins over the other request settings.
 `max_thinking_tokens` and `reasoning_effort` are mutually exclusive, and
 `max_turns` counts every loop iteration, including recovery retries.
 
+`use_responses_api=true` sends an OpenAI reasoning model's requests to the
+Responses API (`/responses`), where Proximus keeps the model's encrypted
+reasoning in the run's own history and replays it each turn. Use it for such a
+model behind a gateway or under a name LiteLLM does not know, for example
+`--model openai/openai/<model> --ak use_responses_api=true --ak reasoning_effort=high`.
+Without it LiteLLM chooses, and an unrecognized name goes to Chat Completions.
+There the request carries no earlier reasoning, so keeping it is up to the
+provider: one gateway kept it for 60 minutes, and after that most turns missed
+the prompt cache. Leave it unset for Anthropic models and for
+OpenAI-compatible servers that only implement Chat Completions.
+
+Each agent step in `agent/trajectory.json` has `extra.provider`: the response
+id, `usage` exactly as the provider reported it (including cache reads and
+writes), request-id and cache headers, the request settings as sent (without
+messages, tools or keys), latency and the number of attempts. On a healthy
+prompt cache, a step's cached tokens are about the previous step's prompt
+tokens.
+
 For deeper changes, subclass the agent and select it with
 `--agent mypkg.module:MyProximus`:
 
