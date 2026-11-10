@@ -100,6 +100,16 @@ class ProximusConfig(AgentOptions):
     """Thinking budget for Anthropic models (at least 1024). Cannot be combined
     with ``reasoning_effort``."""
 
+    use_responses_api: bool | None = None
+    """Send requests to the provider's Responses API (``/responses``) and
+    replay the model's encrypted reasoning items from the run's own history.
+    ``None`` leaves the choice to LiteLLM (it picks Responses for the OpenAI
+    models it knows need it, and only when ``reasoning_effort`` is set).
+    ``True`` forces it; use it for an OpenAI reasoning model behind a gateway
+    or under a name LiteLLM does not know. On Chat Completions such a model's
+    earlier reasoning is not in the request, so keeping it is left to the
+    provider. Not for Anthropic models."""
+
     model_info: dict[str, Any] | None = None
     """LiteLLM model info for the run's model (context limit, vision, prices).
     Set ``max_input_tokens`` to a positive integer if the registry has no valid

@@ -92,6 +92,7 @@ FIELD_VALUES: dict[str, Any] = {
     "temperature": 0.3,
     "api_base": "http://127.0.0.1:9/v1",
     "max_thinking_tokens": 2048,
+    "use_responses_api": True,
     "model_info": {"max_input_tokens": 77777, "supports_vision": False},
 }
 

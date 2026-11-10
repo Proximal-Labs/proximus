@@ -699,7 +699,7 @@ class LLM:
         if config.model_info:
             # Providerless too (responses echo the bare name, which prices
             # them), unless LiteLLM already knows that name for another route.
-            names = {model_name}
+            names = {model_name, self.wire_model_name()}
             bare = model_name.split("/", 1)[-1]
             if bare != model_name and not _litellm_knows(bare):
                 names.add(bare)
@@ -746,6 +746,22 @@ class LLM:
             self._logger.debug(f"Could not determine provider: {e}")
             return False
 
+    def wire_model_name(self) -> str:
+        """The model name given to litellm. With ``use_responses_api`` it
+        carries litellm's ``<provider>/responses/<model>`` marker, which sends
+        the request to the Responses API whatever litellm knows about the
+        model; a registry ``mode`` alone does not do that in every litellm
+        release."""
+        name = self.model_name
+        if not self._config.use_responses_api or self.is_anthropic():
+            return name
+        provider, _, rest = name.partition("/")
+        if not rest:
+            return f"openai/responses/{name}"
+        if rest.startswith("responses/"):
+            return name
+        return f"{provider}/responses/{rest}"
+
     def uses_responses_bridge(self, tools: list[dict[str, Any]] | None) -> bool:
         """Whether litellm will route this request to a Responses API.
 
@@ -754,7 +770,11 @@ class LLM:
         applies. Responses-only params
         400 on /v1/chat/completions, so this must match litellm's own gate.
         """
-        if self.is_anthropic() or not self._config.reasoning_effort:
+        if self.is_anthropic():
+            return False
+        if self._config.use_responses_api:
+            return True  # forced: see wire_model_name
+        if not self._config.reasoning_effort:
             return False
         try:
             if litellm.get_model_info(self.model_name).get("mode") == "responses":
@@ -828,7 +848,7 @@ class LLM:
             # system on /v1/responses).
             messages_for_call = self._xai_system_as_input_items(messages_for_call)
         completion_kwargs: dict[str, Any] = {
-            "model": self.model_name,
+            "model": self.wire_model_name(),
             "messages": messages_for_call,
             "drop_params": True,
             "timeout": timeout,
