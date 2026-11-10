@@ -239,6 +239,21 @@ def is_responses_unknown_item_error(error: BaseException) -> bool:
     return "unknown items in responses api response" in _error_text(error)
 
 
+# A gateway's wording for an upstream 400 it does not pass through. On the
+# Responses API with replayed reasoning, OpenAI rejects some requests
+# nondeterministically (its ``invalid_prompt``): the same request passes on
+# another try. Unlabelled, the error cannot be told from a real bad request,
+# so it is retried a fixed number of times and no more.
+_GATEWAY_INVALID_REQUEST = "upstream model rejected the request as invalid"
+GATEWAY_INVALID_REQUEST_RETRIES = 10
+
+
+def _is_gateway_invalid_request(error: BaseException) -> bool:
+    return isinstance(
+        error, litellm.exceptions.BadRequestError
+    ) and _GATEWAY_INVALID_REQUEST in str(error)
+
+
 def _is_retryable(error: BaseException) -> bool:
     """ContentPolicyViolationError is retryable despite subclassing
     BadRequestError: OpenAI's `invalid_prompt` fires nondeterministically
@@ -911,6 +926,15 @@ class LLM:
                 self._provider_health.retrying(error, sleep)
             log_before_sleep(retry_state)
 
+        gateway_rejections = 0
+
+        def should_retry(error: BaseException) -> bool:
+            nonlocal gateway_rejections
+            if self.uses_responses_bridge(tools) and _is_gateway_invalid_request(error):
+                gateway_rejections += 1
+                return gateway_rejections <= GATEWAY_INVALID_REQUEST_RETRIES
+            return _is_retryable(error)
+
         retryer = tenacity.AsyncRetrying(
             stop=tenacity.stop_any(*stops),
             wait=_WaitCappedByBudget(
@@ -919,7 +943,7 @@ class LLM:
                 ),
                 self._remaining_sec,
             ),
-            retry=tenacity.retry_if_exception(_is_retryable),
+            retry=tenacity.retry_if_exception(should_retry),
             # The warning remains useful locally; provider_health.json in the
             # agent logs carries the same state for external monitoring.
             before_sleep=before_sleep,
