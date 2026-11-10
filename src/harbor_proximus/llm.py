@@ -537,6 +537,11 @@ class ParsedResponse:
     request_thinking: dict[str, Any] | None = None
     request_output_config: dict[str, Any] | None = None
     request_fallbacks: str | None = None
+    # Everything else the provider returned that no field above holds: the
+    # response's top-level fields (id, usage as reported, service tier, ...),
+    # diagnostic response headers, the request settings as sent, latency and
+    # attempts. Recorded per step so a run can be diagnosed afterwards.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -670,6 +675,70 @@ class _StopWhenBudgetSpent(tenacity.stop.stop_base):
     def __call__(self, retry_state: tenacity.RetryCallState) -> bool:
         remaining = self._remaining_sec()
         return remaining is not None and remaining <= 0
+
+
+# Response headers worth keeping: request ids to quote to a provider or
+# gateway, server processing time, and cache or routing markers.
+_DIAGNOSTIC_HEADER = re.compile(
+    r"request[-_]?id|processing[-_]ms|cf-ray|cache|served[-_]by|upstream|region",
+    re.IGNORECASE,
+)
+# Never recorded from a request: the conversation, the tool list, credentials.
+_REQUEST_SKIP = frozenset(
+    {"messages", "tools", "api_key", "client", "extra_headers", "headers"}
+)
+
+
+def _json_safe(value: Any) -> Any:
+    """A JSON-safe copy of a provider object (pydantic model, dict, ...)."""
+    for dump in ("model_dump", "dict"):
+        method = getattr(value, dump, None)
+        if callable(method):
+            try:
+                value = method()
+                break
+            except Exception:  # noqa: BLE001 — telemetry must not fail a turn
+                return None
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_settings(completion_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The request's settings as sent, without the conversation, the tool
+    list or credentials: enough to see which options reached the provider."""
+    settings = {k: v for k, v in completion_kwargs.items() if k not in _REQUEST_SKIP}
+    return _json_safe(settings) or {}
+
+
+def _response_extras(response: Any) -> dict[str, Any]:
+    """What the response carries beyond the parsed fields: its top-level
+    fields other than ``choices`` (so ``usage`` exactly as reported: an absent
+    count stays absent, a reported zero stays zero), plus diagnostic headers,
+    the request settings and the latency of the call."""
+    body = _json_safe(response)
+    extras: dict[str, Any] = (
+        {k: v for k, v in body.items() if k != "choices" and v is not None}
+        if isinstance(body, dict)
+        else {}
+    )
+    hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        headers = hidden.get("additional_headers")
+        if isinstance(headers, dict):
+            kept = {
+                str(name): str(value)[:200]
+                for name, value in headers.items()
+                if _DIAGNOSTIC_HEADER.search(str(name))
+            }
+            if kept:
+                extras["headers"] = kept
+        if hidden.get("proximus_request") is not None:
+            extras["request"] = hidden["proximus_request"]
+        if hidden.get("proximus_latency_sec") is not None:
+            extras["latency_sec"] = hidden["proximus_latency_sec"]
+    return extras
 
 
 class LLM:
@@ -808,7 +877,9 @@ class LLM:
                 self._provider_health.failed(error)
             raise
         self._provider_health.success()
-        return self._parse_response(response)
+        parsed = self._parse_response(response)
+        parsed.extras["attempts"] = int(retryer.statistics.get("attempt_number") or 1)
+        return parsed
 
     async def _acompletion(
         self,
@@ -877,6 +948,7 @@ class LLM:
             fallback_handler = _AnthropicFallbackHTTPHandler(str(server_fallback))
             completion_kwargs["client"] = fallback_handler
 
+        started = time.monotonic()
         try:
             raw_response = await litellm.acompletion(**completion_kwargs)
             if completion_kwargs.get("stream"):
@@ -927,6 +999,13 @@ class LLM:
                 hidden = {}
                 response._hidden_params = hidden
             hidden["anthropic_fallback"] = fallback_handler.last_routing
+
+        hidden = getattr(response, "_hidden_params", None)
+        if not isinstance(hidden, dict):
+            hidden = {}
+            response._hidden_params = hidden
+        hidden["proximus_latency_sec"] = round(time.monotonic() - started, 3)
+        hidden["proximus_request"] = _request_settings(completion_kwargs)
 
         choice = response.choices[0]
         truncated = choice.finish_reason == "length" or self._hit_output_limit(response)
@@ -1041,6 +1120,7 @@ class LLM:
             cached_tokens=cached_tokens,
             cost_usd=self._extract_cost(response),
             response_model=str(getattr(response, "model", "") or "") or None,
+            extras=_response_extras(response),
         )
         hidden = getattr(response, "_hidden_params", None)
         routing = hidden.get("anthropic_fallback") if isinstance(hidden, dict) else None
