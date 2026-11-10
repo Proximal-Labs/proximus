@@ -239,6 +239,21 @@ def is_responses_unknown_item_error(error: BaseException) -> bool:
     return "unknown items in responses api response" in _error_text(error)
 
 
+# A gateway's wording for an upstream 400 it does not pass through. On the
+# Responses API with replayed reasoning, OpenAI rejects some requests
+# nondeterministically (its ``invalid_prompt``): the same request passes on
+# another try. Unlabelled, the error cannot be told from a real bad request,
+# so it is retried a fixed number of times and no more.
+_GATEWAY_INVALID_REQUEST = "upstream model rejected the request as invalid"
+GATEWAY_INVALID_REQUEST_RETRIES = 10
+
+
+def _is_gateway_invalid_request(error: BaseException) -> bool:
+    return isinstance(
+        error, litellm.exceptions.BadRequestError
+    ) and _GATEWAY_INVALID_REQUEST in str(error)
+
+
 def _is_retryable(error: BaseException) -> bool:
     """ContentPolicyViolationError is retryable despite subclassing
     BadRequestError: OpenAI's `invalid_prompt` fires nondeterministically
@@ -320,6 +335,26 @@ def _reasoning_item_dict(item: Any) -> dict[str, Any]:
     )
 
 
+def _keep_every_reasoning_item(choices: list[Any], output_items: list[Any]) -> None:
+    """Put all of a turn's reasoning items, in order, on its first choice.
+
+    LiteLLM's chat bridge keeps one pending reasoning item and overwrites it
+    for each one in the output, so a turn with several keeps only the last
+    (and repeats it on every choice). Replaying part of a turn's reasoning
+    makes the Responses API reject the request as invalid."""
+    reasoning = [
+        _reasoning_item_dict(item)
+        for item in output_items
+        if _is_reasoning_output_item(item)
+    ]
+    if not reasoning:
+        return
+    for index, choice in enumerate(choices):
+        message = getattr(choice, "message", None)
+        if message is not None:
+            message.reasoning_items = reasoning if index == 0 else None
+
+
 def _choices_from_reasoning_only_output(output_items: list[Any]) -> list[Any]:
     """A Responses turn that is only reasoning still has a CoT to replay.
 
@@ -364,9 +399,10 @@ def _install_litellm_reasoning_only_patch() -> None:
         handle_raw_dict_callback: Callable | None = None,
     ) -> list[Any]:
         choices = orig(output_items, handle_raw_dict_callback=handle_raw_dict_callback)
-        if choices:
-            return choices
         items = list(output_items or [])
+        if choices:
+            _keep_every_reasoning_item(choices, items)
+            return choices
         if items and all(_is_reasoning_output_item(item) for item in items):
             return _choices_from_reasoning_only_output(items)
         if not items:
@@ -537,6 +573,11 @@ class ParsedResponse:
     request_thinking: dict[str, Any] | None = None
     request_output_config: dict[str, Any] | None = None
     request_fallbacks: str | None = None
+    # Everything else the provider returned that no field above holds: the
+    # response's top-level fields (id, usage as reported, service tier, ...),
+    # diagnostic response headers, the request settings as sent, latency and
+    # attempts. Recorded per step so a run can be diagnosed afterwards.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -672,6 +713,84 @@ class _StopWhenBudgetSpent(tenacity.stop.stop_base):
         return remaining is not None and remaining <= 0
 
 
+# Response headers worth keeping: request ids to quote to a provider or
+# gateway, server processing time, and cache or routing markers.
+_DIAGNOSTIC_HEADER = re.compile(
+    r"request[-_]?id|processing[-_]ms|cf-ray|cache|served[-_]by|upstream|region",
+    re.IGNORECASE,
+)
+# Never recorded from a request: the conversation, the tool list, credentials.
+_REQUEST_SKIP = frozenset(
+    {"messages", "tools", "api_key", "client", "extra_headers", "headers"}
+)
+
+
+def _json_safe(value: Any) -> Any:
+    """A JSON-safe copy of a provider object (pydantic model, dict, ...)."""
+    for dump in ("model_dump", "dict"):
+        method = getattr(value, dump, None)
+        if callable(method):
+            try:
+                value = method()
+                break
+            except Exception:  # noqa: BLE001 — telemetry must not fail a turn
+                return None
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_settings(completion_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The request's settings as sent, without the conversation, the tool
+    list or credentials: enough to see which options reached the provider."""
+    settings = {k: v for k, v in completion_kwargs.items() if k not in _REQUEST_SKIP}
+    return _json_safe(settings) or {}
+
+
+def _response_extras(response: Any) -> dict[str, Any]:
+    """What the response carries beyond the parsed fields: its top-level
+    fields other than ``choices`` (so ``usage`` exactly as reported: an absent
+    count stays absent, a reported zero stays zero), plus diagnostic headers,
+    the request settings and the latency of the call."""
+    body = _json_safe(response)
+    extras: dict[str, Any] = (
+        {k: v for k, v in body.items() if k != "choices" and v is not None}
+        if isinstance(body, dict)
+        else {}
+    )
+    hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        headers = hidden.get("additional_headers")
+        if isinstance(headers, dict):
+            kept = {
+                str(name): str(value)[:200]
+                for name, value in headers.items()
+                if _DIAGNOSTIC_HEADER.search(str(name))
+            }
+            if kept:
+                extras["headers"] = kept
+        if hidden.get("proximus_request") is not None:
+            extras["request"] = hidden["proximus_request"]
+        if hidden.get("proximus_latency_sec") is not None:
+            extras["latency_sec"] = hidden["proximus_latency_sec"]
+    return extras
+
+
+def _replayable_reasoning_items(items: list[Any]) -> list[Any]:
+    """Reasoning items as they go back to a Responses API: the encrypted
+    content without the readable summary. LiteLLM's chat-to-Responses bridge
+    re-emits summary parts without their ``type``, which the API rejects as
+    an invalid request; the summary is display text (kept in
+    ``reasoning_content``) and the model's reasoning is the encrypted part."""
+    replayable = []
+    for item in items:
+        if isinstance(item, dict) and item.get("summary"):
+            item = {**item, "summary": []}
+        replayable.append(item)
+    return replayable
+
+
 class LLM:
     """One model endpoint. ``remaining_sec`` (None = no budget) caps the
     per-call timeout so a hung request plus retry can't swallow the run."""
@@ -699,7 +818,7 @@ class LLM:
         if config.model_info:
             # Providerless too (responses echo the bare name, which prices
             # them), unless LiteLLM already knows that name for another route.
-            names = {model_name}
+            names = {model_name, self.wire_model_name()}
             bare = model_name.split("/", 1)[-1]
             if bare != model_name and not _litellm_knows(bare):
                 names.add(bare)
@@ -746,6 +865,22 @@ class LLM:
             self._logger.debug(f"Could not determine provider: {e}")
             return False
 
+    def wire_model_name(self) -> str:
+        """The model name given to litellm. With ``use_responses_api`` it
+        carries litellm's ``<provider>/responses/<model>`` marker, which sends
+        the request to the Responses API whatever litellm knows about the
+        model; a registry ``mode`` alone does not do that in every litellm
+        release."""
+        name = self.model_name
+        if not self._config.use_responses_api or self.is_anthropic():
+            return name
+        provider, _, rest = name.partition("/")
+        if not rest:
+            return f"openai/responses/{name}"
+        if rest.startswith("responses/"):
+            return name
+        return f"{provider}/responses/{rest}"
+
     def uses_responses_bridge(self, tools: list[dict[str, Any]] | None) -> bool:
         """Whether litellm will route this request to a Responses API.
 
@@ -754,7 +889,11 @@ class LLM:
         applies. Responses-only params
         400 on /v1/chat/completions, so this must match litellm's own gate.
         """
-        if self.is_anthropic() or not self._config.reasoning_effort:
+        if self.is_anthropic():
+            return False
+        if self._config.use_responses_api:
+            return True  # forced: see wire_model_name
+        if not self._config.reasoning_effort:
             return False
         try:
             if litellm.get_model_info(self.model_name).get("mode") == "responses":
@@ -787,6 +926,15 @@ class LLM:
                 self._provider_health.retrying(error, sleep)
             log_before_sleep(retry_state)
 
+        gateway_rejections = 0
+
+        def should_retry(error: BaseException) -> bool:
+            nonlocal gateway_rejections
+            if self.uses_responses_bridge(tools) and _is_gateway_invalid_request(error):
+                gateway_rejections += 1
+                return gateway_rejections <= GATEWAY_INVALID_REQUEST_RETRIES
+            return _is_retryable(error)
+
         retryer = tenacity.AsyncRetrying(
             stop=tenacity.stop_any(*stops),
             wait=_WaitCappedByBudget(
@@ -795,7 +943,7 @@ class LLM:
                 ),
                 self._remaining_sec,
             ),
-            retry=tenacity.retry_if_exception(_is_retryable),
+            retry=tenacity.retry_if_exception(should_retry),
             # The warning remains useful locally; provider_health.json in the
             # agent logs carries the same state for external monitoring.
             before_sleep=before_sleep,
@@ -808,7 +956,9 @@ class LLM:
                 self._provider_health.failed(error)
             raise
         self._provider_health.success()
-        return self._parse_response(response)
+        parsed = self._parse_response(response)
+        parsed.extras["attempts"] = int(retryer.statistics.get("attempt_number") or 1)
+        return parsed
 
     async def _acompletion(
         self,
@@ -828,7 +978,7 @@ class LLM:
             # system on /v1/responses).
             messages_for_call = self._xai_system_as_input_items(messages_for_call)
         completion_kwargs: dict[str, Any] = {
-            "model": self.model_name,
+            "model": self.wire_model_name(),
             "messages": messages_for_call,
             "drop_params": True,
             "timeout": timeout,
@@ -877,6 +1027,7 @@ class LLM:
             fallback_handler = _AnthropicFallbackHTTPHandler(str(server_fallback))
             completion_kwargs["client"] = fallback_handler
 
+        started = time.monotonic()
         try:
             raw_response = await litellm.acompletion(**completion_kwargs)
             if completion_kwargs.get("stream"):
@@ -927,6 +1078,13 @@ class LLM:
                 hidden = {}
                 response._hidden_params = hidden
             hidden["anthropic_fallback"] = fallback_handler.last_routing
+
+        hidden = getattr(response, "_hidden_params", None)
+        if not isinstance(hidden, dict):
+            hidden = {}
+            response._hidden_params = hidden
+        hidden["proximus_latency_sec"] = round(time.monotonic() - started, 3)
+        hidden["proximus_request"] = _request_settings(completion_kwargs)
 
         choice = response.choices[0]
         truncated = choice.finish_reason == "length" or self._hit_output_limit(response)
@@ -1041,6 +1199,7 @@ class LLM:
             cached_tokens=cached_tokens,
             cost_usd=self._extract_cost(response),
             response_model=str(getattr(response, "model", "") or "") or None,
+            extras=_response_extras(response),
         )
         hidden = getattr(response, "_hidden_params", None)
         routing = hidden.get("anthropic_fallback") if isinstance(hidden, dict) else None
@@ -1110,6 +1269,9 @@ class LLM:
         ):
             prose: Message = {"role": "assistant", "content": parsed.content}
             message["content"] = None
+            # Reasoning precedes the prose in the model's output; replay it
+            # in that order.
+            prose["reasoning_items"] = message.pop("reasoning_items")
             return [prose, message]
         return [message]
 
@@ -1136,7 +1298,9 @@ class LLM:
             message["thinking_blocks"] = parsed.thinking_blocks
         if parsed.reasoning_items:
             # Responses API uses opaque items instead of its readable summary.
-            message["reasoning_items"] = parsed.reasoning_items
+            message["reasoning_items"] = _replayable_reasoning_items(
+                parsed.reasoning_items
+            )
         elif parsed.reasoning_content:
             message["reasoning_content"] = parsed.reasoning_content
         if parsed.provider_specific_fields:
