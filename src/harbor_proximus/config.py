@@ -11,6 +11,12 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 BUDGET_MARGIN_SEC = 120
 # thinking_level values the Gemini Interactions API accepts.
 GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
+# llm_call_kwargs the Interactions path cannot forward: the client sets api_base
+# and api_key itself, a stream returns no interaction, and thinkingConfig is
+# generateContent's shape (reasoning_effort sets thinking_level).
+INTERACTIONS_REJECTED_CALL_KWARGS = frozenset(
+    {"api_base", "api_key", "stream", "thinkingConfig", "thinking_config"}
+)
 
 
 class ProximusConfig(AgentOptions):
@@ -144,6 +150,13 @@ class ProximusConfig(AgentOptions):
             raise ValueError(
                 "model_api='gemini_interactions' needs reasoning_effort in "
                 f"{sorted(GEMINI_THINKING_LEVELS)}, got {self.reasoning_effort!r}"
+            )
+        rejected = sorted(INTERACTIONS_REJECTED_CALL_KWARGS & set(self.llm_call_kwargs))
+        if self.model_api == "gemini_interactions" and rejected:
+            raise ValueError(
+                f"model_api='gemini_interactions' does not take {rejected} in "
+                "llm_call_kwargs: set api_base and api_key_env on the config, and "
+                "reasoning_effort for thinking"
             )
         return self
 
