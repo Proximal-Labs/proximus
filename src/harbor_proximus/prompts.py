@@ -89,6 +89,10 @@ INVALID_IMAGE_MESSAGE = (
     "the provider's stated requirements, then call `view_image` again."
 )
 
+# Content of an assistant turn with neither text nor tool calls, which
+# several providers reject.
+NO_OUTPUT_PLACEHOLDER = "(no output this turn)"
+
 # Closes every text-only assistant turn (Anthropic rejects a conversation
 # ending in an assistant message). Deliberately neutral: prose turns are
 # legitimate work and must not be nagged.

@@ -52,6 +52,20 @@ sandbox, so the model cannot read them; Bedrock, SageMaker and Vertex keep
 LiteLLM's own lookup. Never put keys in `--ak` or `llm_call_kwargs`: Harbor saves
 agent options verbatim in job files.
 
+### Gemini through the Interactions API
+
+`model_api="gemini_interactions"` sends a `gemini/…` model to Google's
+[Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
+through LiteLLM's Interactions route. No extra dependency is needed.
+
+Every call uses `store=False` and sends the full history, including the model's
+original thought signatures and function steps. `reasoning_effort` is required
+and becomes `thinking_level`. `temperature` must also be set explicitly.
+LiteLLM handles transport, exception mapping,
+logging and cost; the agent loop owns retries.
+
+- **Key.** `GEMINI_API_KEY` (or `api_key_env`), as for `gemini/` on LiteLLM.
+
 ## Options and customization
 
 Options follow Harbor's Terminus 2 names where they exist: `max_turns`,
