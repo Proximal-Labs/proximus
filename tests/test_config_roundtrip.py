@@ -128,7 +128,6 @@ def test_every_field_round_trips_through_task_toml_and_factory(
     assert set(kwargs) == {field}
 
     if field == "model_api":
-        kwargs["temperature"] = 0.0  # Interactions requires an explicit temperature.
         kwargs["reasoning_effort"] = "high"
     agent = make_agent(kwargs, tmp_path / "logs", model)
     assert getattr(agent.config, field) == expected

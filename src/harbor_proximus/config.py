@@ -99,8 +99,7 @@ class ProximusConfig(AgentOptions):
     ``{{ instruction }}``."""
 
     temperature: float | None = None
-    """Sampling temperature. Required for ``gemini_interactions``; otherwise
-    omit to use the provider's default."""
+    """Sampling temperature. Omit to use the provider's default."""
 
     api_base: str | None = None
     """Base URL of the model API."""

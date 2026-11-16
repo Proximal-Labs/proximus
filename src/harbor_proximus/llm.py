@@ -688,8 +688,6 @@ class LLM:
         *,
         extra_env: dict[str, str] | None = None,
     ):
-        if config.model_api == "gemini_interactions" and config.temperature is None:
-            raise ValueError("Gemini Interactions requires temperature")
         if (
             config.model_api == "gemini_interactions"
             and config.reasoning_effort is None

@@ -60,7 +60,8 @@ through LiteLLM's Interactions route. No extra dependency is needed.
 
 Every call uses `store=False` and sends the full history, including the model's
 original thought signatures and function steps. `reasoning_effort` is required
-and becomes `thinking_level`. `temperature` must also be set explicitly.
+and becomes `thinking_level`. `temperature` is sent only when set, so Google's
+default applies otherwise.
 LiteLLM handles transport, exception mapping,
 logging and cost; the agent loop owns retries.
 

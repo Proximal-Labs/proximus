@@ -201,9 +201,8 @@ def build_request(
         "thinking_level": reasoning_effort,
         "thinking_summaries": "auto",
     }
-    if temperature is None:
-        raise ValueError("Gemini Interactions requires temperature")
-    generation["temperature"] = temperature
+    if temperature is not None:
+        generation["temperature"] = temperature
     body: dict[str, Any] = {
         "model": model_name,
         "input": steps,
