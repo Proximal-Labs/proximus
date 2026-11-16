@@ -826,7 +826,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "harbor", specifier = "==0.23.0" },
-    { name = "litellm", specifier = ">=1.97.0,<2" },
+    { name = "litellm", specifier = ">=1.105.1,<2" },
     { name = "pillow", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.11.7,<3" },
     { name = "tenacity", specifier = ">=9.1.2,<10" },
