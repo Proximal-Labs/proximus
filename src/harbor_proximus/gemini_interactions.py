@@ -36,6 +36,13 @@ _GENERATION_KEYS = {
 _FAILED_STATUSES = {"failed", "cancelled"}
 # The API rejects empty text blocks; this is the bash tool's wording for no output.
 _EMPTY_RESULT = "(no output)"
+# Gemini's input filter rejects a request with this 400 code ("Input blocked ... can
+# occasionally trigger by mistake on safe coding, security, or biology-related queries").
+# It is not deterministic: verbatim replays of blocked requests went through. So a block
+# is raised as LiteLLM's ContentPolicyViolationError, which the agent loop retries,
+# until this many in a row.
+_CONTENT_BLOCKED = "content_blocked"
+CONTENT_BLOCKED_RETRIES = 5
 
 
 class InteractionFailedError(RuntimeError):
@@ -316,6 +323,7 @@ class InteractionsClient:
         self.model_name = model_name
         self.api_key = api_key
         self.api_base = api_base
+        self._blocked_in_a_row = 0
 
     async def create(self, request: Request) -> ModelResponse:
         timeout = request.options.get("timeout")
@@ -338,12 +346,21 @@ class InteractionsClient:
                 llm_provider="gemini",
             ) from error
         except litellm.exceptions.BadRequestError as error:
+            if _CONTENT_BLOCKED in str(error):
+                self._blocked_in_a_row += 1
+                if self._blocked_in_a_row > CONTENT_BLOCKED_RETRIES:
+                    raise
+                raise litellm.exceptions.ContentPolicyViolationError(
+                    message=str(error), model=self.model_name, llm_provider="gemini"
+                ) from error
             if "recitation" not in str(error).lower():
                 raise
             # Output blocked as recitation arrives as a 400. generateContent
             # reports it as finishReason RECITATION, which the chat path gets
             # back as an empty content_filter turn; do the same.
+            self._blocked_in_a_row = 0
             return to_model_response(self.model_name, [], "recitation", None, {})
+        self._blocked_in_a_row = 0
         if interaction.status in _FAILED_STATUSES:
             raise InteractionFailedError(
                 f"Gemini interaction {interaction.id} ended {interaction.status}"

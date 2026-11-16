@@ -209,6 +209,57 @@ def test_recitation_block_is_not_fatal(server):
     assert len(server.requests) == 1  # not retried
 
 
+def input_blocked() -> tuple[int, dict]:
+    return (
+        400,
+        {
+            "error": {
+                "message": "Input blocked: This request was blocked by Gemini's filters. "
+                "They can occasionally trigger by mistake on safe coding, security, or "
+                "biology-related queries.",
+                "code": "content_blocked",
+            }
+        },
+    )
+
+
+def test_input_block_is_retried_with_the_same_request(server, monkeypatch):
+    """Live (full-budget runs): Gemini's input filter blocked 14 of 272 trials, and verbatim
+    replays of the blocked requests went through. So a block is retried like a provider
+    error, up to CONTENT_BLOCKED_RETRIES in a row; a success starts the count again."""
+    monkeypatch.setattr("tenacity.wait_random_exponential", lambda **_: 0)
+    retries = gi.CONTENT_BLOCKED_RETRIES
+    server.replies = [
+        *[input_blocked() for _ in range(retries)],
+        interaction([call_step("c1", "bash", command="gdb -batch ./fs")]),
+        *[input_blocked() for _ in range(retries)],
+        interaction([call_step("c2", "submit")]),
+    ]
+    llm = make_llm(server)
+    first = [{"role": "user", "content": "Debug the filesystem."}]
+
+    async def turns():
+        parsed = await llm.query(first, tools=None)
+        return await llm.query(tool_turn(llm, first, parsed), tools=None)
+
+    assert asyncio.run(turns()).tool_calls[0].name == "submit"
+    assert len(server.requests) == 2 * (retries + 1)
+    assert all(body == server.requests[0] for body in server.requests[: retries + 1])
+    assert all(body == server.requests[-1] for body in server.requests[retries + 1 :])
+
+
+def test_input_block_that_keeps_repeating_ends_the_call(server, monkeypatch):
+    monkeypatch.setattr("tenacity.wait_random_exponential", lambda **_: 0)
+    server.replies = [input_blocked() for _ in range(gi.CONTENT_BLOCKED_RETRIES + 2)]
+    llm = make_llm(server)
+    with pytest.raises(
+        litellm.exceptions.BadRequestError, match="content_blocked"
+    ) as raised:
+        asyncio.run(llm.query([{"role": "user", "content": "hi"}], tools=None))
+    assert not isinstance(raised.value, litellm.exceptions.ContentPolicyViolationError)
+    assert len(server.requests) == gi.CONTENT_BLOCKED_RETRIES + 1
+
+
 def test_empty_tool_output_is_not_sent_as_empty_text(server):
     """The API rejects empty text blocks. Proximus's bash tool already says "(no output)",
     but any other tool message with empty content reaches the wire as text ''."""
