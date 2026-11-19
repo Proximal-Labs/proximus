@@ -1,6 +1,5 @@
 """Unit tests for the Proximus agent loop (LLM calls mocked)."""
 
-import asyncio
 import base64
 import copy
 import json
@@ -38,6 +37,7 @@ from harbor_proximus.providers.base import (
 )
 from harbor_proximus.timer import DEADLINE_PATH, write_deadline
 from harbor_proximus.tools import EnvironmentGoneError
+from tests.local_shell import LocalShellEnv
 
 pytestmark = pytest.mark.unit
 
@@ -1467,23 +1467,9 @@ async def test_progress_file_reinjected_into_handoff(tmp_path, monkeypatch):
     assert any("PROGRESS.md" in c for c in env.all_commands)
 
 
-class StrictShellEnv:
-    """Runs commands in a local shell and decodes output strictly, as
-    Modal's SDK does: a split UTF-8 character raises UnicodeDecodeError."""
-
-    async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
-        p = await asyncio.create_subprocess_shell(
-            command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await p.communicate()
-        return ExecResult(
-            stdout=stdout.decode(), stderr=stderr.decode(), return_code=p.returncode
-        )
-
-
 async def read_progress(tmp_path, notes) -> str | None:
     agent = make_agent(tmp_path, progress_file=str(notes))
-    agent._environment = StrictShellEnv()  # type: ignore[assignment]
+    agent._environment = LocalShellEnv()  # type: ignore[assignment]
     return await agent._read_progress()
 
 
