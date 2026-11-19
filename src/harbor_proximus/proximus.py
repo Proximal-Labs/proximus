@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import itertools
 import json
@@ -704,17 +705,20 @@ class Proximus(BaseAgent):
 
     async def _read_progress(self) -> str | None:
         """Tail of the model's append-only durable notes: an overgrown file
-        needs its latest state, not its opening plan."""
+        needs its latest state, not its opening plan. The bytes cross as
+        base64 and are decoded here: a byte cut can split a character, and
+        some backends decode exec output strictly (Modal's SDK raises)."""
         try:
             result = await self._environment.exec(
                 f"tail -c {PROGRESS_REINJECT_MAX_BYTES} "
-                f"{shlex.quote(self.config.progress_file)} 2>/dev/null",
+                f"{shlex.quote(self.config.progress_file)} 2>/dev/null | base64",
                 timeout_sec=30,
             )
+            data = base64.b64decode(str(result.stdout or ""))
         except Exception as e:
             self.logger.debug(f"PROGRESS.md re-injection read failed: {e}")
             return None
-        return str(result.stdout or "").strip() or None
+        return utils.decode_utf8_tail(data).strip() or None
 
     def _drop_middle(self) -> None:
         """Halve the history between the head (system prompt + task message)

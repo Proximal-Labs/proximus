@@ -1,5 +1,6 @@
 """Unit tests for the Proximus agent loop (LLM calls mocked)."""
 
+import base64
 import copy
 import json
 import logging
@@ -17,6 +18,7 @@ from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import AgentConfig
 
+import harbor_proximus.proximus as proximus_module
 from harbor_proximus import Proximus
 from harbor_proximus.config import PROGRESS_FILE
 from harbor_proximus.llm import LLM
@@ -35,6 +37,7 @@ from harbor_proximus.providers.base import (
 )
 from harbor_proximus.timer import DEADLINE_PATH, write_deadline
 from harbor_proximus.tools import EnvironmentGoneError
+from tests.local_shell import LocalShellEnv
 
 pytestmark = pytest.mark.unit
 
@@ -1438,7 +1441,8 @@ class ProgressEnv(FakeEnv):
             command, cwd=cwd, env=env, timeout_sec=timeout_sec, user=user
         )
         if "PROGRESS.md" in command:
-            return ExecResult(stdout=_PROGRESS_NOTES, stderr=None, return_code=0)
+            stdout = base64.b64encode(_PROGRESS_NOTES.encode()).decode()
+            return ExecResult(stdout=stdout, stderr=None, return_code=0)
         return result
 
 
@@ -1461,6 +1465,42 @@ async def test_progress_file_reinjected_into_handoff(tmp_path, monkeypatch):
     assert "[Context compacted]" in handoff
     assert _PROGRESS_NOTES in handoff
     assert any("PROGRESS.md" in c for c in env.all_commands)
+
+
+async def read_progress(tmp_path, notes) -> str | None:
+    agent = make_agent(tmp_path, progress_file=str(notes))
+    agent._environment = LocalShellEnv()  # type: ignore[assignment]
+    return await agent._read_progress()
+
+
+@pytest.mark.parametrize("split_bytes", [1, 2, 3])
+async def test_progress_tail_cut_inside_a_character(tmp_path, monkeypatch, split_bytes):
+    """A cut that leaves 1-3 bytes of a 4-byte character skips them, even on
+    a single line with no newline to resynchronize on."""
+    notes = tmp_path / "PROGRESS.md"
+    notes.write_text("# Progress\n" + "🚀" * 10)
+    # The cut keeps three whole rockets plus the last `split_bytes` of a fourth.
+    monkeypatch.setattr(
+        proximus_module, "PROGRESS_REINJECT_MAX_BYTES", split_bytes + 3 * 4
+    )
+    assert await read_progress(tmp_path, notes) == "🚀" * 3
+
+
+async def test_progress_with_invalid_utf8_is_kept(tmp_path):
+    notes = tmp_path / "PROGRESS.md"
+    notes.write_bytes(b"ran ./probe: \xff\xfe\nnext: fix the parser\n")
+    progress = await read_progress(tmp_path, notes)
+    assert progress == "ran ./probe: \ufffd\ufffd\nnext: fix the parser"
+
+
+async def test_progress_under_the_cap_is_read_whole(tmp_path):
+    notes = tmp_path / "PROGRESS.md"
+    notes.write_text("# Progress\nparser fixed ✅\n")
+    assert await read_progress(tmp_path, notes) == "# Progress\nparser fixed ✅"
+
+
+async def test_missing_progress_file_reads_as_none(tmp_path):
+    assert await read_progress(tmp_path, tmp_path / "absent.md") is None
 
 
 async def test_dead_sandbox_ends_the_run(tmp_path, monkeypatch):

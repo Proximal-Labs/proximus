@@ -16,6 +16,17 @@ def read_script(name: str) -> str:
     return (_PACKAGE_DIR / "scripts" / name).read_text()
 
 
+def decode_utf8_tail(data: bytes) -> str:
+    """Decode UTF-8 bytes that were cut at an arbitrary byte offset. The cut
+    can land inside a character, leaving up to three continuation bytes
+    (0b10xxxxxx) that cannot start one; skipping them lands on the next
+    character. Bytes invalid in the source itself decode to U+FFFD."""
+    start = 0
+    while start < min(3, len(data)) and data[start] & 0xC0 == 0x80:
+        start += 1
+    return data[start:].decode("utf-8", errors="replace")
+
+
 def write_artifact(
     logs_dir: Path,
     name: str,

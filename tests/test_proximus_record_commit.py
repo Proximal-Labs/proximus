@@ -12,9 +12,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from harbor.environments.base import ExecResult
 
 from harbor_proximus.submissions import SubmissionError, Submissions
+from tests.local_shell import LocalShellEnv
 
 pytestmark = [
     pytest.mark.unit,
@@ -34,27 +34,6 @@ def _base_env(home: Path) -> dict[str, str]:
         "HOME": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
     }
-
-
-class LocalGitEnv:
-    """Duck-typed environment that runs harness scripts FOR REAL with bash,
-    the way a sandbox would: inputs as exec env vars, nothing spliced."""
-
-    def __init__(self, base_env: dict[str, str]):
-        self._base_env = base_env
-
-    async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
-        result = subprocess.run(
-            ["bash", "-c", command],
-            capture_output=True,
-            text=True,
-            env={**self._base_env, **(env or {})},
-            cwd=cwd,
-            timeout=timeout_sec,
-        )
-        return ExecResult(
-            stdout=result.stdout, stderr=result.stderr, return_code=result.returncode
-        )
 
 
 def git(repo: Path, home: Path, *args: str) -> str:
@@ -84,7 +63,7 @@ def workspace(tmp_path: Path) -> tuple[Path, Path, Submissions]:
     git(repo, home, "commit", "-qm", "baseline", "--no-verify")
     subs = Submissions(
         tmp_path / "logs",
-        LocalGitEnv(_base_env(home)),  # type: ignore[arg-type]
+        LocalShellEnv(_base_env(home)),  # type: ignore[arg-type]
         workdir=str(repo),
         elapsed_sec=lambda: 0.0,
         logger=logger,
